@@ -48,7 +48,7 @@ const event = (() => {
             if (!topics[topic] || topics[topic].length < 1) return;
 
             topics[topic].forEach((listener) => {
-                listener.listener(data || {})
+                listener.listener(data !== undefined ? data : {})
             });
         }
     }
@@ -56,6 +56,8 @@ const event = (() => {
 
 // events
 const LATENCY_CHECK_REQUESTED = 'latencyCheckRequested';
+const PING_REQUEST = 'pingRequest';
+const PING_RESPONSE = 'pingResponse';
 
 const GAME_ROOM_AVAILABLE = 'gameRoomAvailable';
 const GAME_SAVED = 'gameSaved';
@@ -67,6 +69,8 @@ const CONNECTION_CLOSED = 'connectionClosed';
 
 const MEDIA_STREAM_INITIALIZED = 'mediaStreamInitialized';
 const MEDIA_STREAM_SDP_AVAILABLE = 'mediaStreamSdpAvailable';
+const MEDIA_STREAM_CANDIDATE_ADD = 'mediaStreamCandidateAdd';
+const MEDIA_STREAM_CANDIDATE_FLUSH = 'mediaStreamCandidateFlush';
 const MEDIA_STREAM_READY = 'mediaStreamReady';
 
 const GAMEPAD_CONNECTED = 'gamepadConnected';
@@ -79,3 +83,14 @@ const MENU_RELEASED = 'menuReleased';
 const KEY_PRESSED = 'keyPressed';
 const KEY_RELEASED = 'keyReleased';
 const KEY_STATE_UPDATED = 'keyStateUpdated';
+const KEYBOARD_TOGGLE_FILTER_MODE = 'keyboardToggleFilterMode';
+const KEYBOARD_KEY_PRESSED = 'keyboardKeyPressed';
+const AXIS_CHANGED = 'axisChanged';
+const CONTROLLER_UPDATED = 'controllerUpdated';
+
+const DPAD_TOGGLE = 'dpadToggle';
+const STATS_TOGGLE = 'statsToggle';
+const HELP_OVERLAY_TOGGLED = 'helpOverlayToggled';
+
+const SETTINGS_CHANGED = 'settingsChanged';
+const SETTINGS_CLOSED = 'settingsClosed';

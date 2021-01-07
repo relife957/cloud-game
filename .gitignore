@@ -60,5 +60,7 @@ bin/
 .coverage.out
 _output/
 ./build
+release/
+vendor/
 
 .dockerignore

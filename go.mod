@@ -1,25 +1,36 @@
-module github.com/giongto35/cloud-game
+module github.com/giongto35/cloud-game/v2
 
-go 1.12
+go 1.13
 
 require (
-	cloud.google.com/go v0.43.0
-	github.com/gen2brain/x264-go v0.0.0-20180306035800-58f586137654
-	github.com/gofrs/uuid v3.2.0+incompatible
+	cloud.google.com/go v0.74.0 // indirect
+	cloud.google.com/go/storage v1.12.0
+	github.com/cavaliercoder/grab v1.0.1-0.20201108051000-98a5bfe305ec
+	github.com/faiface/mainthread v0.0.0-20171120011319-8b78f0a41ae3
+	github.com/fsnotify/fsnotify v1.4.9
+	github.com/gen2brain/x264-go v0.0.0-20200605131102-0523307cbe23
+	github.com/go-gl/gl v0.0.0-20190320180904-bf2b1f2f34d7
+	github.com/gofrs/flock v0.8.0
+	github.com/gofrs/uuid v4.0.0+incompatible
 	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b
-	github.com/gorilla/mux v1.7.3
-	github.com/gorilla/websocket v1.4.0
-	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
-	github.com/modern-go/reflect2 v1.0.1 // indirect
-	github.com/pion/webrtc/v2 v2.1.16
-	github.com/prometheus/client_golang v1.1.0
-	github.com/spf13/pflag v1.0.3
-	golang.org/x/crypto v0.0.0-20191206172530-e9b2fee46413
-	golang.org/x/image v0.0.0-20191009234506-e7c1f5e7dbb8
-	golang.org/x/net v0.0.0-20191209160850-c0dbc17a3553 // indirect
-	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e // indirect
-	golang.org/x/sys v0.0.0-20191218084908-4a24b4065292 // indirect
-	golang.org/x/tools v0.0.0-20191218191756-61f5e7d2990e // indirect
-	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543 // indirect
-	gopkg.in/hraban/opus.v2 v2.0.0-20180426093920-0f2e0b4fc6cd
+	github.com/google/uuid v1.1.3 // indirect
+	github.com/gorilla/mux v1.8.0
+	github.com/gorilla/websocket v1.4.2
+	github.com/kkyr/fig v0.2.0
+	github.com/mitchellh/mapstructure v1.4.0 // indirect
+	github.com/pelletier/go-toml v1.8.1 // indirect
+	github.com/pion/interceptor v0.0.9
+	github.com/pion/rtp v1.6.2
+	github.com/pion/webrtc/v3 v3.0.3
+	github.com/prometheus/client_golang v1.9.0
+	github.com/spf13/pflag v1.0.5
+	github.com/veandco/go-sdl2 v0.4.5
+	golang.org/x/crypto v0.0.0-20201221181555-eec23a3978ad
+	golang.org/x/image v0.0.0-20201208152932-35266b937fa6
+	golang.org/x/net v0.0.0-20201224014010-6772e930b67b // indirect
+	golang.org/x/sys v0.0.0-20201231184435-2d18734c6014 // indirect
+	golang.org/x/tools v0.0.0-20210104081019-d8d6ddbec6ee // indirect
+	google.golang.org/genproto v0.0.0-20201214200347-8c77b98c765d // indirect
+	gopkg.in/hraban/opus.v2 v2.0.0-20201025103112-d779bb1cc5a2
+	gopkg.in/yaml.v2 v2.4.0 // indirect
 )

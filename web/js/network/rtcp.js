@@ -6,6 +6,9 @@ const rtcp = (() => {
     let connection;
     let inputChannel;
     let mediaStream;
+    let candidates = Array();
+    let isAnswered = false;
+    let isFlushing = false;
 
     let connected = false;
     let inputReady = false;
@@ -20,28 +23,56 @@ const rtcp = (() => {
         mediaStream = new MediaStream();
 
         // input channel, ordered + reliable, id 0
-        inputChannel = connection.createDataChannel('a', {ordered: true, negotiated: true, id: 0,});
-        inputChannel.onopen = () => {
-            log.debug('[rtcp] the input channel has opened');
-            inputReady = true;
-            event.pub(CONNECTION_READY)
-        };
-        inputChannel.onclose = () => log.debug('[rtcp] the input channel has closed');
+        // inputChannel = connection.createDataChannel('a', {ordered: true, negotiated: true, id: 0,});
+        // recv dataChannel from worker
+        connection.ondatachannel = e => {
+            log.debug(`[rtcp] ondatachannel: ${e.channel.label}`)
+            inputChannel = e.channel;
+            inputChannel.onopen = () => {
+                log.debug('[rtcp] the input channel has opened');
+                inputReady = true;
+                event.pub(CONNECTION_READY)
+            };
+            inputChannel.onclose = () => log.debug('[rtcp] the input channel has closed');
+        }
 
-        connection.addTransceiver('video', {'direction': 'recvonly'});
-        connection.addTransceiver('audio', {'direction': 'recvonly'});
+        // addVoiceStream(connection)
 
         connection.oniceconnectionstatechange = ice.onIceConnectionStateChange;
         connection.onicegatheringstatechange = ice.onIceStateChange;
         connection.onicecandidate = ice.onIcecandidate;
-        connection.ontrack = event => mediaStream.addTrack(event.track);
+        connection.ontrack = event => {
+            mediaStream.addTrack(event.track);
+        }
 
-        connection.createOffer({offerToReceiveVideo: true, offerToReceiveAudio: true})
-            .then(offer => {
-                log.info(offer.sdp);
-                connection.setLocalDescription(offer).catch(log.error);
-            });
+        socket.send({
+            'id': 'init_webrtc',
+            'data': JSON.stringify({'is_mobile': env.isMobileDevice()}),
+        });
     };
+
+    async function addVoiceStream(connection) {
+        let stream = null;
+
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({video: false, audio: true});
+
+            stream.getTracks().forEach(function (track) {
+                log.info("Added voice track")
+                connection.addTrack(track);
+            });
+
+        } catch (e) {
+            log.info("Error getting audio stream from getUserMedia")
+            log.info(e)
+
+        } finally {
+            socket.send({
+                'id': 'init_webrtc',
+                'data': JSON.stringify({'is_mobile': env.isMobileDevice()}),
+            });
+        }
+    }
 
     const ice = (() => {
         let isGatheringDone = false;
@@ -49,22 +80,18 @@ const rtcp = (() => {
 
         const ICE_TIMEOUT = 2000;
 
-        const sendCandidates = () => {
-            if (isGatheringDone) return;
-            const session = btoa(JSON.stringify(connection.localDescription));
-            const data = JSON.stringify({"sdp": session, "is_mobile": env.isMobileDevice()});
-            socket.send({"id": "initwebrtc", "data": data});
-            isGatheringDone = true;
-        };
-
         return {
             onIcecandidate: event => {
-                if (event.candidate && !isGatheringDone) {
-                    log.info(JSON.stringify(event.candidate));
-                } else {
-                    sendCandidates()
+                // this trigger when setRemoteDesc success
+                // send any candidate to worker
+                if (event.candidate != null) {
+                    candidate = JSON.stringify(event.candidate);
+                    log.info(`[rtcp] got ice candidate: ${candidate}`);
+                    socket.send({
+                        'id': 'ice_candidate',
+                        'data': btoa(candidate),
+                    })
                 }
-                // TODO: Fix curPacketID
             },
             onIceStateChange: event => {
                 switch (event.target.iceGatheringState) {
@@ -72,7 +99,7 @@ const rtcp = (() => {
                         log.info('[rtcp] ice gathering');
                         timeForIceGathering = setTimeout(() => {
                             log.info(`[rtcp] ice gathering was aborted due to timeout ${ICE_TIMEOUT}ms`);
-                            sendCandidates();
+                            // sendCandidates();
                         }, ICE_TIMEOUT);
                         break;
                     case 'complete':
@@ -111,15 +138,44 @@ const rtcp = (() => {
 
     return {
         start: start,
-        setRemoteDescription: (data, media) => {
-            connection.setRemoteDescription(new RTCSessionDescription(JSON.parse(atob(data))))
-            // set media object stream
-                .then(() => {
-                    media.srcObject = mediaStream;
-                })
+        setRemoteDescription: async (data, media) => {
+            const offer = new RTCSessionDescription(JSON.parse(atob(data)));
+            await connection.setRemoteDescription(offer);
+
+            const answer = await connection.createAnswer();
+            // Chrome bug https://bugs.chromium.org/p/chromium/issues/detail?id=818180 workaround
+            // force stereo params for Opus tracks (a=fmtp:111 ...)
+            answer.sdp = answer.sdp.replace(/(a=fmtp:111 .*)/g, '$1;stereo=1;sprop-stereo=1');
+            await connection.setLocalDescription(answer);
+
+            isAnswered = true;
+            event.pub(MEDIA_STREAM_CANDIDATE_FLUSH);
+
+            socket.send({'id': 'answer', 'data': btoa(JSON.stringify(answer))});
+
+            media.srcObject = mediaStream;
+        },
+        addCandidate: (data) => {
+            if (data === '') {
+                event.pub(MEDIA_STREAM_CANDIDATE_FLUSH);
+            } else {
+                candidates.push(data);
+            }
+        },
+        flushCandidate: () => {
+            if (isFlushing || !isAnswered) return;
+            isFlushing = true;
+            candidates.forEach(data => {
+                d = atob(data);
+                candidate = new RTCIceCandidate(JSON.parse(d));
+                log.debug('[rtcp] add candidate: ' + d);
+                connection.addIceCandidate(candidate);
+            });
+            isFlushing = false;
         },
         input: (data) => inputChannel.send(data),
         isConnected: () => connected,
-        isInputReady: () => inputReady
+        isInputReady: () => inputReady,
+        getConnection: () => connection,
     }
 })(event, socket, env, log);

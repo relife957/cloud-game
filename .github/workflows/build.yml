@@ -1,0 +1,121 @@
+# ------------------------------------------------------------
+#  Build workflow (Linux x64, macOS x64, Windows x64)
+# ------------------------------------------------------------
+
+name: build
+on:
+  push:
+    branches:
+      - master
+    tags-ignore:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+
+jobs:
+
+  build:
+    name: Build
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions/setup-go@v2
+        with:
+          go-version: ^1.15
+
+      - name: Get Linux dev libraries and tools
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make pkg-config libvpx-dev libopus-dev libopusfile-dev libsdl2-dev libgl1-mesa-glx
+
+      - name: Get MacOS dev libraries and tools
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install libvpx pkg-config opus opusfile sdl2
+
+      - name: Get Windows dev libraries and tools
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-dlfcn
+            mingw-w64-x86_64-libvpx
+            mingw-w64-x86_64-opusfile
+            mingw-w64-x86_64-SDL2
+
+      - name: Load Go modules maybe?
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build Windows app
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: |
+          wget -q https://github.com/pal1000/mesa-dist-win/releases/download/20.2.1/mesa3d-20.2.1-release-mingw.7z
+          "/c/Program Files/7-Zip/7z.exe" x mesa3d-20.2.1-release-mingw.7z -omesa
+          echo -e " 2\r\n 8\r\n " >> commands
+          ./mesa/systemwidedeploy.cmd < ./commands
+
+          wget -q https://buildbot.libretro.com/nightly/windows/x86_64/latest/mupen64plus_next_libretro.dll.zip
+          "/c/Program Files/7-Zip/7z.exe" x mupen64plus_next_libretro.dll.zip -oassets/cores
+
+          make build
+
+      - name: Build Linux app
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          make build
+
+      - name: Build macOS app
+        if: matrix.os == 'macos-latest'
+        run: |
+          make build
+
+      - name: Verify core rendering (windows-latest)
+        if: matrix.os == 'windows-latest' && always()
+        shell: msys2 {0}
+        env:
+          MESA_GL_VERSION_OVERRIDE: 3.3COMPAT
+        run: |
+          go test -run TestAllEmulatorRooms ./pkg/worker/room -v -renderFrames -autoGlContext -outputPath "../../../_rendered"
+
+      - name: Verify core rendering (ubuntu-latest)
+        if: matrix.os == 'ubuntu-latest' && always()
+        env:
+          MESA_GL_VERSION_OVERRIDE: 3.3COMPAT
+        run: |
+          xvfb-run --auto-servernum go test -run TestAllEmulatorRooms ./pkg/worker/room -v -renderFrames -autoGlContext -outputPath "../../../_rendered"
+
+      - name: Verify core rendering (macos-latest)
+        if: matrix.os == 'macos-latest' && always()
+        run: |
+          go test -run TestAllEmulatorRooms ./pkg/worker/room -v -renderFrames -outputPath "../../../_rendered"
+
+      - uses: actions/upload-artifact@v2
+        with:
+          path: _rendered/*.png
+
+  docker_build_check:
+    name: Build (docker)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Get the source
+        uses: actions/checkout@v2
+      - name: Try to build Docker image
+        run: docker build .

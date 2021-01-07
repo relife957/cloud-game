@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/giongto35/cloud-game/pkg/config"
-	"github.com/giongto35/cloud-game/pkg/encoder"
-	"github.com/giongto35/cloud-game/pkg/encoder/h264encoder"
-	vpxencoder "github.com/giongto35/cloud-game/pkg/encoder/vpx-encoder"
-	"github.com/giongto35/cloud-game/pkg/util"
+	encoderConfig "github.com/giongto35/cloud-game/v2/pkg/config/encoder"
+	"github.com/giongto35/cloud-game/v2/pkg/encoder"
+	"github.com/giongto35/cloud-game/v2/pkg/encoder/h264encoder"
+	vpxencoder "github.com/giongto35/cloud-game/v2/pkg/encoder/vpx-encoder"
+	"github.com/giongto35/cloud-game/v2/pkg/util"
+	"github.com/giongto35/cloud-game/v2/pkg/webrtc"
 	"gopkg.in/hraban/opus.v2"
 )
 
@@ -38,18 +39,35 @@ func resample(pcm []int16, targetSize int, srcSampleRate int, dstSampleRate int)
 	return newPCM
 }
 
-func min(x int, y int) int {
-	if x < y {
-		return x
-	}
-	return y
+func (r *Room) startVoice() {
+	// broadcast voice
+	go func() {
+		for sample := range r.voiceInChannel {
+			r.voiceOutChannel <- sample
+		}
+	}()
+
+	// fanout voice
+	go func() {
+		for sample := range r.voiceOutChannel {
+			for _, webRTC := range r.rtcSessions {
+				if webRTC.IsConnected() {
+					// NOTE: can block here
+					webRTC.VoiceOutChannel <- sample
+				}
+			}
+		}
+		for _, webRTC := range r.rtcSessions {
+			close(webRTC.VoiceOutChannel)
+		}
+	}()
 }
 
-func (r *Room) startAudio(sampleRate int) {
+func (r *Room) startAudio(sampleRate int, audio encoderConfig.Audio) {
 	log.Println("Enter fan audio")
-	srcSampleRate := sampleRate
 
-	enc, err := opus.NewEncoder(config.AUDIO_RATE, 2, opus.AppAudio)
+	srcSampleRate := sampleRate
+	enc, err := opus.NewEncoder(audio.Frequency, audio.Channels, opus.AppAudio)
 	if err != nil {
 		log.Println("[!] Cannot create audio encoder", err)
 	}
@@ -58,19 +76,13 @@ func (r *Room) startAudio(sampleRate int) {
 	enc.SetBitrateToAuto()
 	enc.SetComplexity(10)
 
-	dstBufferSize := config.AUDIO_FRAME
-	srcBufferSize := dstBufferSize * srcSampleRate / config.AUDIO_RATE
+	dstBufferSize := audio.GetFrameDuration()
+	srcBufferSize := dstBufferSize * srcSampleRate / audio.Frequency
 	pcm := make([]int16, srcBufferSize) // 640 * 1000 / 16000 == 40 ms
 	idx := 0
 
 	// fanout Audio
-	fmt.Println("listening audio channel", r.IsRunning)
 	for sample := range r.audioChannel {
-		if !r.IsRunning {
-			log.Println("Room ", r.ID, " audio channel closed")
-			return
-		}
-
 		for i := 0; i < len(sample); {
 			rem := util.MinInt(len(sample)-i, len(pcm)-idx)
 			copy(pcm[idx:idx+rem], sample[i:i+rem])
@@ -79,7 +91,7 @@ func (r *Room) startAudio(sampleRate int) {
 
 			if idx == len(pcm) {
 				data := make([]byte, 1024*2)
-				dstpcm := resample(pcm, dstBufferSize, srcSampleRate, config.AUDIO_RATE)
+				dstpcm := resample(pcm, dstBufferSize, srcSampleRate, audio.Frequency)
 				n, err := enc.Encode(dstpcm, data)
 
 				if err != nil {
@@ -104,30 +116,34 @@ func (r *Room) startAudio(sampleRate int) {
 		}
 
 	}
+	log.Println("Room ", r.ID, " audio channel closed")
 }
 
-// startVideo listen from imageChannel and push to Encoder. The output of encoder will be pushed to webRTC
-func (r *Room) startVideo(width, height int, videoEncoderType string) {
-	var encoder encoder.Encoder
+// startVideo processes imageChannel images with an encoder (codec) then pushes the result to WebRTC.
+func (r *Room) startVideo(width, height int, videoCodec encoder.VideoCodec) {
+	var enc encoder.Encoder
 	var err error
 
-	log.Println("Video Encoder: ", videoEncoderType)
-	if videoEncoderType == config.CODEC_H264 {
-		encoder, err = h264encoder.NewH264Encoder(width, height, 1)
+	log.Println("Video Encoder: ", videoCodec)
+	if videoCodec == encoder.H264 {
+		enc, err = h264encoder.NewH264Encoder(width, height, 1)
 	} else {
-		encoder, err = vpxencoder.NewVpxEncoder(width, height, 20, 1200, 5)
+		enc, err = vpxencoder.NewVpxEncoder(width, height, 20, 1200, 5)
 	}
 
 	defer func() {
-		encoder.Stop()
+		enc.Stop()
 	}()
 
 	if err != nil {
 		fmt.Println("error create new encoder", err)
 		return
 	}
-	einput := encoder.GetInputChan()
-	eoutput := encoder.GetOutputChan()
+
+	r.encoder = enc
+
+	einput := enc.GetInputChan()
+	eoutput := enc.GetOutputChan()
 
 	// send screenshot
 	go func() {
@@ -141,23 +157,21 @@ func (r *Room) startVideo(width, height int, videoEncoderType string) {
 		for data := range eoutput {
 			// TODO: r.rtcSessions is rarely updated. Lock will hold down perf
 			for _, webRTC := range r.rtcSessions {
+				if !webRTC.IsConnected() {
+					continue
+				}
 				// encode frame
 				// fanout imageChannel
-				if webRTC.IsConnected() {
-					// NOTE: can block here
-					webRTC.ImageChannel <- data
-				}
+				// NOTE: can block here
+				webRTC.ImageChannel <- webrtc.WebFrame{Data: data.Data, Timestamp: data.Timestamp}
 			}
 		}
 	}()
 
 	for image := range r.imageChannel {
-		if !r.IsRunning {
-			log.Println("Room ", r.ID, " video channel closed")
-			return
-		}
 		if len(einput) < cap(einput) {
-			einput <- image
+			einput <- encoder.InFrame{Image: image.Image, Timestamp: image.Timestamp}
 		}
 	}
+	log.Println("Room ", r.ID, " video channel closed")
 }

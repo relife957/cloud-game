@@ -6,21 +6,34 @@
  * @version 1
  */
 const socket = (() => {
-    const pingIntervalMs = 1000 / 5;
+    // TODO: this ping is for maintain websocket state
+    /*
+        https://tools.ietf.org/html/rfc6455#section-5.5.2
+
+        Chrome doesn't support
+            https://groups.google.com/a/chromium.org/forum/#!topic/net-dev/2RAm-ZYAIYY
+            https://bugs.chromium.org/p/chromium/issues/detail?id=706002
+
+        Firefox has option but not enable 'network.websocket.timeout.ping.request'
+
+        Suppose ping message must be sent from WebSocket Server.
+        Gorilla WS doesnot support it.
+        https://github.com/gorilla/websocket/blob/5ed622c449da6d44c3c8329331ff47a9e5844f71/examples/filewatch/main.go#L104
+
+        Below is high level implementation of ping.
+        // TODO: find the best ping time, currently 2 seconds works well in Chrome+Firefox
+    */
+    const pingIntervalMs = 2000; // 2 secs
+    // const pingIntervalMs = 1000 / 5; // too much
 
     let conn;
     let curPacketId = '';
 
     const init = (roomId, zone) => {
-        const paramString = new URLSearchParams({room_id: roomId, zone: zone})
-
-        // if localhost, local LAN connection
-        if (location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.hostname.startsWith("192.168")) {
-            scheme = "ws"
-        } else {
-            scheme = "wss"
-        }
-        conn = new WebSocket(`${scheme}://${location.host}/ws?${paramString.toString()}`);
+        const params = new URLSearchParams({room_id: roomId, zone: zone}).toString()
+        const address = `${location.protocol !== 'https:' ? 'ws' : 'wss'}://${location.host}/ws?${params}`;
+        console.info(`[ws] connecting to ${address}`);
+        conn = new WebSocket(address);
 
         // Clear old roomID
         conn.onopen = () => {
@@ -46,16 +59,15 @@ const socket = (() => {
                     let serverData = JSON.parse(data.data);
                     event.pub(MEDIA_STREAM_INITIALIZED, {stunturn: serverData.shift(), games: serverData});
                     break;
-                case 'sdp':
+                case 'offer':
+                    // this is offer from worker
                     event.pub(MEDIA_STREAM_SDP_AVAILABLE, {sdp: data.data});
                     break;
-                case 'requestOffer':
-                    // !to remove? wtf
-                    curPacketId = data.packet_id;
-                    event.pub(MEDIA_STREAM_READY);
+                case 'ice_candidate':
+                    event.pub(MEDIA_STREAM_CANDIDATE_ADD, {candidate: data.data});
                     break;
                 case 'heartbeat':
-                    // reserved
+                    event.pub(PING_RESPONSE);
                     break;
                 case 'start':
                     event.pub(GAME_ROOM_AVAILABLE, {roomId: data.room_id});
@@ -66,7 +78,7 @@ const socket = (() => {
                 case 'load':
                     event.pub(GAME_LOADED);
                     break;
-                case 'playerIdx':
+                case 'player_index':
                     event.pub(GAME_PLAYER_IDX, data.data);
                     break;
                 case 'checkLatency':
@@ -78,7 +90,11 @@ const socket = (() => {
     };
 
     // TODO: format the package with time
-    const ping = () => send({"id": "heartbeat", "data": Date.now().toString()});
+    const ping = () => {
+        const time = Date.now();
+        send({"id": "heartbeat", "data": time.toString()});
+        event.pub(PING_REQUEST, {time: time});
+    }
     const send = (data) => conn.send(JSON.stringify(data));
     const latency = (workers, packetId) => send({
         "id": "checkLatency",
@@ -87,7 +103,7 @@ const socket = (() => {
     });
     const saveGame = () => send({"id": "save", "data": ""});
     const loadGame = () => send({"id": "load", "data": ""});
-    const updatePlayerIndex = (idx) => send({"id": "playerIdx", "data": idx.toString()});
+    const updatePlayerIndex = (idx) => send({"id": "player_index", "data": idx.toString()});
     const startGame = (gameName, isMobile, roomId, playerIndex) => send({
         "id": "start",
         "data": JSON.stringify({
@@ -98,6 +114,7 @@ const socket = (() => {
         "player_index": playerIndex
     });
     const quitGame = (roomId) => send({"id": "quit", "data": "", "room_id": roomId});
+    const toggleMultitap = () => send({"id": "multitap", "data": ""});
 
     return {
         init: init,
@@ -107,6 +124,7 @@ const socket = (() => {
         loadGame: loadGame,
         updatePlayerIndex: updatePlayerIndex,
         startGame: startGame,
-        quitGame: quitGame
+        quitGame: quitGame,
+        toggleMultitap: toggleMultitap,
     }
 })($, event, log);

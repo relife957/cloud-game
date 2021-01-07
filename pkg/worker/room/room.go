@@ -1,26 +1,29 @@
 package room
 
 import (
-	"image"
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/giongto35/cloud-game/pkg/config/worker"
-
-	"github.com/giongto35/cloud-game/pkg/config"
-	"github.com/giongto35/cloud-game/pkg/emulator"
-	"github.com/giongto35/cloud-game/pkg/emulator/libretro/nanoarch"
-	"github.com/giongto35/cloud-game/pkg/util"
-	"github.com/giongto35/cloud-game/pkg/util/gamelist"
-	"github.com/giongto35/cloud-game/pkg/webrtc"
-	storage "github.com/giongto35/cloud-game/pkg/worker/cloud-storage"
+	"github.com/giongto35/cloud-game/v2/pkg/config/worker"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator/libretro/nanoarch"
+	"github.com/giongto35/cloud-game/v2/pkg/encoder"
+	"github.com/giongto35/cloud-game/v2/pkg/games"
+	"github.com/giongto35/cloud-game/v2/pkg/util"
+	"github.com/giongto35/cloud-game/v2/pkg/webrtc"
+	storage "github.com/giongto35/cloud-game/v2/pkg/worker/cloud-storage"
 )
 
 // Room is a game session. multi webRTC sessions can connect to a same game.
@@ -29,12 +32,17 @@ type Room struct {
 	ID string
 
 	// imageChannel is image stream received from director
-	imageChannel <-chan *image.RGBA
+	imageChannel <-chan nanoarch.GameFrame
 	// audioChannel is audio stream received from director
 	audioChannel <-chan []int16
 	// inputChannel is input stream send to director. This inputChannel is combined
 	// input from webRTC + connection info (player indexc)
 	inputChannel chan<- nanoarch.InputEvent
+	// voiceInChannel is voice stream received from users
+	voiceInChannel chan []byte
+	// voiceOutChannel is voice stream broadcasted to all users
+	voiceOutChannel chan []byte
+	voiceSample     [][]byte
 	// State of room
 	IsRunning bool
 	// Done channel is to fire exit event when room is closed
@@ -49,8 +57,8 @@ type Room struct {
 	onlineStorage *storage.Client
 	// GameName
 	gameName string
-	// Meta of game
-	//meta emulator.Meta
+
+	encoder encoder.Encoder
 }
 
 const separator = "___"
@@ -58,35 +66,92 @@ const separator = "___"
 // TODO: Remove after fully migrate
 const oldSeparator = "|"
 
-// NewRoom creates a new room
-func NewRoom(roomID string, gameName string, videoEncoderType string, onlineStorage *storage.Client, cfg worker.Config) *Room {
-	// If no roomID is given, generate it from gameName
-	// If the is roomID, get gameName from roomID
-	if roomID == "" {
-		roomID = generateRoomID(gameName)
-	} else {
-		gameName = getGameNameFromRoomID(roomID)
-		log.Println("Get Gamename from RoomID", gameName)
-	}
-	gameInfo := gamelist.GetGameInfoFromName(gameName)
+const SocketAddrTmpl = "/tmp/cloudretro-retro-%s.sock"
+const bufSize = 245969
 
-	log.Println("Init new room: ", roomID, gameName, gameInfo)
+// NewVideoImporter return image Channel from stream
+func NewVideoImporter(roomID string) chan nanoarch.GameFrame {
+	sockAddr := fmt.Sprintf(SocketAddrTmpl, roomID)
+	imgChan := make(chan nanoarch.GameFrame)
+
+	l, err := net.Listen("unix", sockAddr)
+	if err != nil {
+		log.Fatal("listen error:", err)
+	}
+
+	log.Println("Creating uds server", sockAddr)
+	go func(l net.Listener) {
+		defer l.Close()
+
+		conn, err := l.Accept()
+		if err != nil {
+			log.Fatal("Accept error: ", err)
+		}
+		defer conn.Close()
+
+		log.Println("Received new conn")
+		log.Println("Spawn Importer")
+
+		fullbuf := make([]byte, bufSize*2)
+		fullbuf = fullbuf[:0]
+
+		for {
+			// TODO: Not reallocate
+			buf := make([]byte, bufSize)
+			l, err := conn.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("error: %v", err)
+				}
+				continue
+			}
+
+			buf = buf[:l]
+			fullbuf = append(fullbuf, buf...)
+			if len(fullbuf) >= bufSize {
+				bufs := bytes.NewBuffer(fullbuf)
+				dec := gob.NewDecoder(bufs)
+
+				frame := nanoarch.GameFrame{}
+				err := dec.Decode(&frame)
+				if err != nil {
+					log.Fatalf("%v", err)
+				}
+				imgChan <- frame
+				fullbuf = fullbuf[bufSize:len(fullbuf)]
+			}
+		}
+	}(l)
+
+	return imgChan
+}
+
+// NewRoom creates a new room
+func NewRoom(roomID string, game games.GameMetadata, videoCodec encoder.VideoCodec, onlineStorage *storage.Client, cfg worker.Config) *Room {
+	if roomID == "" {
+		roomID = generateRoomID(game.Name)
+	}
+
+	log.Println("Init new room: ", roomID, game)
 	inputChannel := make(chan nanoarch.InputEvent, 100)
 
 	room := &Room{
 		ID: roomID,
 
-		inputChannel:  inputChannel,
-		rtcSessions:   []*webrtc.WebRTC{},
-		sessionsLock:  &sync.Mutex{},
-		IsRunning:     true,
-		onlineStorage: onlineStorage,
+		inputChannel:    inputChannel,
+		imageChannel:    nil,
+		voiceInChannel:  make(chan []byte, 1),
+		voiceOutChannel: make(chan []byte, 1),
+		rtcSessions:     []*webrtc.WebRTC{},
+		sessionsLock:    &sync.Mutex{},
+		IsRunning:       true,
+		onlineStorage:   onlineStorage,
 
 		Done: make(chan struct{}, 1),
 	}
 
 	// Check if room is on local storage, if not, pull from GCS to local storage
-	go func(game gamelist.GameInfo, roomID string) {
+	go func(game games.GameMetadata, roomID string) {
 		// Check room is on local or fetch from server
 		savepath := util.GetSavePath(roomID)
 		log.Println("Check ", savepath, " on online storage : ", room.isGameOnLocal(savepath))
@@ -95,49 +160,70 @@ func NewRoom(roomID string, gameName string, videoEncoderType string, onlineStor
 		}
 
 		// If not then load room or create room from local.
-		log.Printf("Room %s started. GamePath: %s, GameName: %s", roomID, game.Path, game.Name)
+		log.Printf("Room %s started. GameName: %s, WithGame: %t", roomID, game.Name, cfg.Encoder.WithoutGame)
 
 		// Spawn new emulator based on gameName and plug-in all channels
-		emuName, _ := config.FileTypeToEmulator[game.Type]
+		emuName := cfg.Emulator.GetEmulatorByRom(game.Type)
+		libretroConfig := cfg.Emulator.GetLibretroCoreConfig(emuName)
 
-		director, imageChannel, audioChannel := nanoarch.Init(emuName, roomID, inputChannel)
-		room.director = director
-		room.imageChannel = imageChannel
-		room.audioChannel = audioChannel
+		if cfg.Encoder.WithoutGame {
+			// Run without game, image stream is communicated over unixsocket
+			imageChannel := NewVideoImporter(roomID)
+			director, _, audioChannel := nanoarch.Init(roomID, false, inputChannel, libretroConfig)
+			room.imageChannel = imageChannel
+			room.director = director
+			room.audioChannel = audioChannel
+		} else {
+			// Run without game, image stream is communicated over image channel
+			director, imageChannel, audioChannel := nanoarch.Init(roomID, true, inputChannel, libretroConfig)
+			room.imageChannel = imageChannel
+			room.director = director
+			room.audioChannel = audioChannel
+		}
 
 		gameMeta := room.director.LoadMeta(game.Path)
 
-		// nwidth, nheight are the webRTC output size.
-		// There are currently two approach
+		// nwidth, nheight are the WebRTC output size
 		var nwidth, nheight int
-		if cfg.EnableAspectRatio {
-			baseAspectRatio := float64(gameMeta.BaseWidth) / float64(gameMeta.Height)
-			nwidth, nheight = resizeToAspect(baseAspectRatio, cfg.Width, cfg.Height)
-			log.Printf("Viewport size will be changed from %dx%d (%f) -> %dx%d", cfg.Width, cfg.Height,
+		emu, ar := cfg.Emulator, cfg.Emulator.AspectRatio
+
+		if ar.Keep {
+			baseAspectRatio := float64(gameMeta.BaseWidth) / float64(ar.Height)
+			nwidth, nheight = resizeToAspect(baseAspectRatio, ar.Width, ar.Height)
+			log.Printf("Viewport size will be changed from %dx%d (%f) -> %dx%d", ar.Width, ar.Height,
 				baseAspectRatio, nwidth, nheight)
 		} else {
 			nwidth, nheight = gameMeta.BaseWidth, gameMeta.BaseHeight
 			log.Printf("Viewport custom size is disabled, base size will be used instead %dx%d", nwidth, nheight)
 		}
-		if cfg.Scale > 1 {
-			nwidth, nheight = nwidth*cfg.Scale, nheight*cfg.Scale
+
+		if emu.Scale > 1 {
+			nwidth, nheight = nwidth*emu.Scale, nheight*emu.Scale
 			log.Printf("Viewport size has scaled to %dx%d", nwidth, nheight)
 		}
 
-		room.director.SetViewport(nwidth, nheight)
-
 		log.Println("meta: ", gameMeta)
 
+		// set resulting game frame size considering
+		// its orientation
+		encoderW, encoderH := nwidth, nheight
+		if gameMeta.Rotation.IsEven {
+			encoderW, encoderH = nheight, nwidth
+		}
+
+		room.director.SetViewport(encoderW, encoderH)
+
 		// Spawn video and audio encoding for webRTC
-		go room.startVideo(nwidth, nheight, videoEncoderType)
-		go room.startAudio(gameMeta.AudioSampleRate)
+		go room.startVideo(encoderW, encoderH, videoCodec)
+		go room.startAudio(gameMeta.AudioSampleRate, cfg.Encoder.Audio)
+		go room.startVoice()
 		room.director.Start()
 
 		log.Printf("Room %s ended", roomID)
 
 		// TODO: do we need GC, we can remove it
 		runtime.GC()
-	}(gameInfo, roomID)
+	}(game, roomID)
 
 	return room
 }
@@ -153,14 +239,8 @@ func resizeToAspect(ratio float64, sw int, sh int) (dw int, dh int) {
 	return
 }
 
-// getEmulator creates new emulator and run it
-func getEmulator(emuName string, roomID string, imageChannel chan<- *image.RGBA, audioChannel chan<- []int16, inputChannel <-chan int) emulator.CloudEmulator {
-
-	return nanoarch.NAEmulator
-}
-
 // getGameNameFromRoomID parse roomID to get roomID and gameName
-func getGameNameFromRoomID(roomID string) string {
+func GetGameNameFromRoomID(roomID string) string {
 	parts := strings.Split(roomID, separator)
 	if len(parts) > 1 {
 		return parts[1]
@@ -205,6 +285,23 @@ func (r *Room) startWebRTCSession(peerconnection *webrtc.WebRTC) {
 		}
 	}()
 
+	log.Println("Start WebRTC session")
+	go func() {
+
+		// set up voice input and output. A room has multiple voice input and only one combined voice output.
+		for voiceInput := range peerconnection.VoiceInChannel {
+			// NOTE: when room is no longer running. InputChannel needs to have extra event to go inside the loop
+			if peerconnection.Done || !peerconnection.IsConnected() || !r.IsRunning {
+				break
+			}
+
+			if peerconnection.IsConnected() {
+				r.voiceInChannel <- voiceInput
+			}
+
+		}
+	}()
+
 	// bug: when inputchannel here = nil , skip and finish
 	for input := range peerconnection.InputChannel {
 		// NOTE: when room is no longer running. InputChannel needs to have extra event to go inside the loop
@@ -213,11 +310,8 @@ func (r *Room) startWebRTCSession(peerconnection *webrtc.WebRTC) {
 		}
 
 		if peerconnection.IsConnected() {
-			// the first 10 bits belong to player 1
-			// the next 10 belongs to player 2 ...
-			// We standardize and put it to inputChannel (20 bits)
 			select {
-			case r.inputChannel <- nanoarch.InputEvent{KeyState: input, PlayerIdx: peerconnection.GameMeta.PlayerIndex, ConnID: peerconnection.ID}:
+			case r.inputChannel <- nanoarch.InputEvent{RawState: input, PlayerIdx: peerconnection.GameMeta.PlayerIndex, ConnID: peerconnection.ID}:
 			default:
 			}
 		}
@@ -234,13 +328,14 @@ func (r *Room) RemoveSession(w *webrtc.WebRTC) {
 		log.Println("found session: ", w.ID)
 		if s.ID == w.ID {
 			r.rtcSessions = append(r.rtcSessions[:i], r.rtcSessions[i+1:]...)
+			s.RoomID = ""
 			log.Println("Removed session ", s.ID, " from room: ", r.ID)
 			break
 		}
 	}
 	// Detach input. Send end signal
 	select {
-	case r.inputChannel <- nanoarch.InputEvent{KeyState: -1, ConnID: w.ID}:
+	case r.inputChannel <- nanoarch.InputEvent{RawState: []byte{0xFF, 0xFF}, ConnID: w.ID}:
 	default:
 	}
 }
@@ -273,7 +368,9 @@ func (r *Room) Close() {
 		// the lock is holding before coming to close, so it will cause deadlock if SaveGame is synchronous
 		go func() {
 			// Save before close, so save can have correct state (Not sure) may again cause deadlock
-			r.SaveGame()
+			if err := r.SaveGame(); err != nil {
+				log.Println("[error] couldn't save the game during closing")
+			}
 			r.director.Close()
 		}()
 	} else {
@@ -281,6 +378,8 @@ func (r *Room) Close() {
 	}
 	log.Println("Closing input of room ", r.ID)
 	close(r.inputChannel)
+	close(r.voiceOutChannel)
+	close(r.voiceInChannel)
 	close(r.Done)
 	// Close here is a bit wrong because this read channel
 	// Just dont close it, let it be gc
@@ -332,14 +431,23 @@ func (r *Room) saveOnlineRoomToLocal(roomID string, savepath string) error {
 	if err != nil {
 		return err
 	}
+
 	// Save the data fetched from gcloud to local server
-	ioutil.WriteFile(savepath, data, 0644)
+	if data != nil {
+		_ = ioutil.WriteFile(savepath, data, 0644)
+	}
 
 	return nil
 }
 
 func (r *Room) LoadGame() error {
 	err := r.director.LoadGame()
+
+	return err
+}
+
+func (r *Room) ToggleMultitap() error {
+	err := r.director.ToggleMultitap()
 
 	return err
 }

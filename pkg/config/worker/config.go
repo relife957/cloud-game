@@ -1,55 +1,68 @@
 package worker
 
 import (
-	"github.com/giongto35/cloud-game/pkg/monitoring"
-	"github.com/spf13/pflag"
+	"encoding/json"
+
+	"github.com/giongto35/cloud-game/v2/pkg/config"
+	"github.com/giongto35/cloud-game/v2/pkg/config/emulator"
+	"github.com/giongto35/cloud-game/v2/pkg/config/encoder"
+	"github.com/giongto35/cloud-game/v2/pkg/config/monitoring"
+	"github.com/giongto35/cloud-game/v2/pkg/config/shared"
+	webrtcConfig "github.com/giongto35/cloud-game/v2/pkg/config/webrtc"
+	flag "github.com/spf13/pflag"
 )
 
 type Config struct {
-	Port            int
-	OverlordAddress string
-
-	// video
-	Scale             int
-	EnableAspectRatio bool
-	Width             int
-	Height            int
-	Zone              string
-
-	MonitoringConfig monitoring.ServerMonitoringConfig
-}
-
-func NewDefaultConfig() Config {
-	return Config{
-		Port:              8800,
-		OverlordAddress:   "localhost:8000",
-		Scale:             1,
-		EnableAspectRatio: false,
-		Width:             320,
-		Height:            240,
-		Zone:              "",
-		MonitoringConfig: monitoring.ServerMonitoringConfig{
-			Port:          6601,
-			URLPrefix:     "/worker",
-			MetricEnabled: true,
-		},
+	Encoder     encoder.Encoder
+	Emulator    emulator.Emulator
+	Environment shared.Environment
+	Worker      struct {
+		Monitoring monitoring.ServerMonitoringConfig
+		Network    struct {
+			CoordinatorAddress string
+			Zone               string
+		}
+		Server shared.Server
 	}
+	Webrtc webrtcConfig.Webrtc
+	Loaded bool
 }
 
-func (c *Config) AddFlags(fs *pflag.FlagSet) *Config {
-	fs.IntVarP(&c.Port, "port", "", 8800, "OverWorker server port")
-	fs.StringVarP(&c.OverlordAddress, "overlordhost", "", c.OverlordAddress, "OverWorker URL to connect")
-	fs.StringVarP(&c.Zone, "zone", "z", c.Zone, "Zone of the worker")
+// allows custom config path
+var configPath string
 
-	fs.IntVarP(&c.Scale, "scale", "s", c.Scale, "Set output viewport scale factor")
-	fs.BoolVarP(&c.EnableAspectRatio, "ar", "", c.EnableAspectRatio, "Enable Aspect Ratio")
-	fs.IntVarP(&c.Width, "width", "w", c.Width, "Set custom viewport width")
-	fs.IntVarP(&c.Height, "height", "h", c.Height, "Set custom viewport height")
+func NewConfig() (conf Config) {
+	if err := config.LoadConfig(&conf, configPath); err == nil {
+		conf.Loaded = true
+	}
+	return
+}
 
-	fs.BoolVarP(&c.MonitoringConfig.MetricEnabled, "monitoring.metric", "m", c.MonitoringConfig.MetricEnabled, "Enable prometheus metric for server")
-	fs.BoolVarP(&c.MonitoringConfig.ProfilingEnabled, "monitoring.pprof", "p", c.MonitoringConfig.ProfilingEnabled, "Enable golang pprof for server")
-	fs.IntVarP(&c.MonitoringConfig.Port, "monitoring.port", "", c.MonitoringConfig.Port, "Monitoring server port")
-	fs.StringVarP(&c.MonitoringConfig.URLPrefix, "monitoring.prefix", "", c.MonitoringConfig.URLPrefix, "Monitoring server url prefix")
+func EmptyConfig() (conf Config) {
+	conf.Loaded = false
+	return
+}
 
-	return c
+// ParseFlags updates config values from passed runtime flags.
+// Define own flags with default value set to the current config param.
+// Don't forget to call flag.Parse().
+func (c *Config) ParseFlags() {
+	c.Environment.WithFlags()
+	c.Worker.Server.WithFlags()
+	flag.IntVar(&c.Worker.Monitoring.Port, "monitoring.port", c.Worker.Monitoring.Port, "Monitoring server port")
+	flag.StringVar(&c.Worker.Network.CoordinatorAddress, "coordinatorhost", c.Worker.Network.CoordinatorAddress, "Worker URL to connect")
+	flag.StringVar(&c.Worker.Network.Zone, "zone", c.Worker.Network.Zone, "Worker network zone (us, eu, etc.)")
+	flag.StringVarP(&configPath, "conf", "c", configPath, "Set custom configuration file path")
+	flag.Parse()
+}
+
+func (c *Config) Serialize() []byte {
+	res, _ := json.Marshal(c)
+	return res
+}
+
+func (c *Config) Deserialize(data []byte) {
+	if err := json.Unmarshal(data, c); err == nil {
+		c.Loaded = true
+	}
 }

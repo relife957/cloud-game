@@ -1,13 +1,18 @@
 package nanoarch
 
 import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
 	"image"
 	"log"
+	"net"
 	"sync"
 	"time"
 
-	"github.com/giongto35/cloud-game/pkg/config"
-	"github.com/giongto35/cloud-game/pkg/util"
+	config "github.com/giongto35/cloud-game/v2/pkg/config/emulator"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator"
+	"github.com/giongto35/cloud-game/v2/pkg/util"
 )
 
 /*
@@ -46,29 +51,49 @@ void coreLog_cgo(enum retro_log_level level, const char *msg);
 */
 import "C"
 
+const numAxes = 4
+
+type controllerState struct {
+	keyState uint16
+	axes     [numAxes]int16
+}
+
 // naEmulator implements CloudEmulator
 type naEmulator struct {
-	imageChannel chan<- *image.RGBA
-	audioChannel chan<- []int16
-	inputChannel <-chan InputEvent
+	imageChannel  chan<- GameFrame
+	audioChannel  chan<- []int16
+	inputChannel  <-chan InputEvent
+	videoExporter *VideoExporter
 
-	meta            config.EmulatorMeta
+	meta            emulator.Metadata
 	gamePath        string
 	roomID          string
 	gameName        string
 	isSavingLoading bool
 
-	keysMap map[string][]int
-	done    chan struct{}
+	controllersMap map[string][]controllerState
+	done           chan struct{}
 
 	// lock to lock uninteruptable operation
 	lock *sync.Mutex
 }
 
+// VideoExporter produces image frame to unix socket
+type VideoExporter struct {
+	sock         net.Conn
+	imageChannel chan<- GameFrame
+}
+
 type InputEvent struct {
-	KeyState  int
+	RawState  []byte
 	PlayerIdx int
 	ConnID    string
+}
+
+// GameFrame contains image and timeframe
+type GameFrame struct {
+	Image     *image.RGBA
+	Timestamp uint32
 }
 
 var NAEmulator *naEmulator
@@ -76,31 +101,75 @@ var outputImg *image.RGBA
 
 const maxPort = 8
 
+const SocketAddrTmpl = "/tmp/cloudretro-retro-%s.sock"
+
 // NAEmulator implements CloudEmulator interface based on NanoArch(golang RetroArch)
-func NewNAEmulator(etype string, roomID string, inputChannel <-chan InputEvent) (*naEmulator, chan *image.RGBA, chan []int16) {
-	meta := config.EmulatorConfig[etype]
-	imageChannel := make(chan *image.RGBA, 30)
+func NewNAEmulator(roomID string, inputChannel <-chan InputEvent, conf config.LibretroCoreConfig) (*naEmulator, chan GameFrame, chan []int16) {
+	imageChannel := make(chan GameFrame, 30)
 	audioChannel := make(chan []int16, 30)
 
 	return &naEmulator{
-		meta:         meta,
-		imageChannel: imageChannel,
-		audioChannel: audioChannel,
-		inputChannel: inputChannel,
-		keysMap:      map[string][]int{},
-		roomID:       roomID,
-		done:         make(chan struct{}, 1),
-		lock:         &sync.Mutex{},
+		meta: emulator.Metadata{
+			LibPath:       conf.Lib,
+			ConfigPath:    conf.Config,
+			Ratio:         conf.Ratio,
+			IsGlAllowed:   conf.IsGlAllowed,
+			UsesLibCo:     conf.UsesLibCo,
+			HasMultitap:   conf.HasMultitap,
+			AutoGlContext: conf.AutoGlContext,
+		},
+		imageChannel:   imageChannel,
+		audioChannel:   audioChannel,
+		inputChannel:   inputChannel,
+		controllersMap: map[string][]controllerState{},
+		roomID:         roomID,
+		done:           make(chan struct{}, 1),
+		lock:           &sync.Mutex{},
 	}, imageChannel, audioChannel
 }
 
+// NewVideoExporter creates new video Exporter that produces to unix socket
+func NewVideoExporter(roomID string, imgChannel chan GameFrame) *VideoExporter {
+	sockAddr := fmt.Sprintf(SocketAddrTmpl, roomID)
+
+	go func(sockAddr string) {
+		log.Println("Dialing to ", sockAddr)
+		conn, err := net.Dial("unix", sockAddr)
+		if err != nil {
+			log.Fatal("accept error: ", err)
+		}
+
+		defer conn.Close()
+
+		for img := range imgChannel {
+			reqBodyBytes := new(bytes.Buffer)
+			gob.NewEncoder(reqBodyBytes).Encode(img)
+			//fmt.Printf("%+v %+v %+v \n", img.Image.Stride, img.Image.Rect.Max.X, len(img.Image.Pix))
+			// conn.Write(img.Image.Pix)
+			b := reqBodyBytes.Bytes()
+			fmt.Printf("Bytes %d\n", len(b))
+			conn.Write(b)
+		}
+	}(sockAddr)
+
+	return &VideoExporter{
+		imageChannel: imgChannel,
+	}
+
+}
+
 // Init initialize new RetroArch cloud emulator
-func Init(etype string, roomID string, inputChannel <-chan InputEvent) (*naEmulator, chan *image.RGBA, chan []int16) {
-	emulator, imageChannel, audioChannel := NewNAEmulator(etype, roomID, inputChannel)
+// withImageChan returns an image stream as Channel for output else it will write to unix socket
+func Init(roomID string, withImageChannel bool, inputChannel <-chan InputEvent, config config.LibretroCoreConfig) (*naEmulator, chan GameFrame, chan []int16) {
+	emulator, imageChannel, audioChannel := NewNAEmulator(roomID, inputChannel, config)
 	// Set to global NAEmulator
 	NAEmulator = emulator
+	if !withImageChannel {
+		NAEmulator.videoExporter = NewVideoExporter(roomID, imageChannel)
+	}
 
 	go NAEmulator.listenInput()
+
 	return emulator, imageChannel, audioChannel
 }
 
@@ -108,24 +177,27 @@ func (na *naEmulator) listenInput() {
 	// input from javascript follows bitmap. Ex: 00110101
 	// we decode the bitmap and send to channel
 	for inpEvent := range NAEmulator.inputChannel {
-		inpBitmap := inpEvent.KeyState
+		inpBitmap := uint16(inpEvent.RawState[1])<<8 + uint16(inpEvent.RawState[0])
 
-		if inpBitmap == -1 {
+		if inpBitmap == 0xFFFF {
 			// terminated
-			delete(na.keysMap, inpEvent.ConnID)
+			delete(na.controllersMap, inpEvent.ConnID)
 			continue
 		}
 
-		if _, ok := na.keysMap[inpEvent.ConnID]; !ok {
-			na.keysMap[inpEvent.ConnID] = make([]int, maxPort)
+		if _, ok := na.controllersMap[inpEvent.ConnID]; !ok {
+			na.controllersMap[inpEvent.ConnID] = make([]controllerState, maxPort)
 		}
 
-		na.keysMap[inpEvent.ConnID][inpEvent.PlayerIdx] = inpBitmap
+		na.controllersMap[inpEvent.ConnID][inpEvent.PlayerIdx].keyState = inpBitmap
+		for i := 0; i < numAxes && (i+1)*2+1 < len(inpEvent.RawState); i++ {
+			na.controllersMap[inpEvent.ConnID][inpEvent.PlayerIdx].axes[i] = int16(inpEvent.RawState[(i+1)*2+1])<<8 + int16(inpEvent.RawState[(i+1)*2])
+		}
 	}
 }
 
-func (na *naEmulator) LoadMeta(path string) config.EmulatorMeta {
-	coreLoad(na.meta.Path)
+func (na *naEmulator) LoadMeta(path string) emulator.Metadata {
+	coreLoad(na.meta)
 	coreLoadGame(path)
 	na.gamePath = path
 
@@ -135,14 +207,11 @@ func (na *naEmulator) LoadMeta(path string) config.EmulatorMeta {
 func (na *naEmulator) SetViewport(width int, height int) {
 	// outputImg is tmp img used for decoding and reuse in encoding flow
 	outputImg = image.NewRGBA(image.Rect(0, 0, width, height))
-
-	ewidth = width
-	eheight = height
 }
 
 func (na *naEmulator) Start() {
 	na.playGame(na.gamePath)
-	ticker := time.NewTicker(time.Second / 60)
+	ticker := time.NewTicker(time.Second / time.Duration(na.meta.Fps))
 
 	for range ticker.C {
 		select {
@@ -194,11 +263,33 @@ func (na *naEmulator) LoadGame() error {
 	return nil
 }
 
+func (na *naEmulator) ToggleMultitap() error {
+	if na.roomID != "" {
+		toggleMultitap()
+	}
+
+	return nil
+}
+
 func (na *naEmulator) GetHashPath() string {
 	return util.GetSavePath(na.roomID)
+}
+
+func (*naEmulator) GetViewport() interface{} {
+	return outputImg
 }
 
 func (na *naEmulator) Close() {
 	// Unload and deinit in the core.
 	close(na.done)
+}
+
+// GetLock makes the emulator exclusively locked.
+func (na *naEmulator) GetLock() {
+	na.lock.Lock()
+}
+
+// ReleaseLock removes an exclusive lock from the emulator.
+func (na *naEmulator) ReleaseLock() {
+	na.lock.Unlock()
 }

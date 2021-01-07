@@ -4,6 +4,8 @@ const KEY = (() => {
         B: 'b',
         X: 'x',
         Y: 'y',
+        L: 'l',
+        R: 'r',
         START: 'start',
         SELECT: 'select',
         LOAD: 'load',
@@ -20,5 +22,13 @@ const KEY = (() => {
         PAD2: 'pad2',
         PAD3: 'pad3',
         PAD4: 'pad4',
+        STATS: 'stats',
+        SETTINGS: 'settings',
+        DTOGGLE: 'dtoggle',
+        L2: 'l2',
+        R2: 'r2',
+        L3: 'l3',
+        R3: 'r3',
+        MULTITAP: 'multitap',
     }
 })();

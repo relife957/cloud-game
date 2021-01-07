@@ -8,30 +8,28 @@ import (
 	"path"
 	"time"
 
-	"github.com/giongto35/cloud-game/pkg/config"
-	"github.com/giongto35/cloud-game/pkg/config/worker"
-
-	"github.com/giongto35/cloud-game/pkg/util"
-	"github.com/giongto35/cloud-game/pkg/webrtc"
-	storage "github.com/giongto35/cloud-game/pkg/worker/cloud-storage"
-	"github.com/giongto35/cloud-game/pkg/worker/room"
+	"github.com/giongto35/cloud-game/v2/pkg/config/worker"
+	"github.com/giongto35/cloud-game/v2/pkg/cws/api"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator/libretro/manager/remotehttp"
+	"github.com/giongto35/cloud-game/v2/pkg/encoder"
+	"github.com/giongto35/cloud-game/v2/pkg/environment"
+	"github.com/giongto35/cloud-game/v2/pkg/games"
+	"github.com/giongto35/cloud-game/v2/pkg/util"
+	"github.com/giongto35/cloud-game/v2/pkg/webrtc"
+	storage "github.com/giongto35/cloud-game/v2/pkg/worker/cloud-storage"
+	"github.com/giongto35/cloud-game/v2/pkg/worker/room"
 	"github.com/gorilla/websocket"
 )
 
-const (
-	gameboyIndex = "./static/game.html"
-	debugIndex   = "./static/game.html"
-)
-
-// Flag to determine if the server is overlord or not
+// Flag to determine if the server is coordinator or not
 var upgrader = websocket.Upgrader{}
 
 type Handler struct {
-	// Client that connects to overlord
-	oClient *OverlordClient
-	// Raw address of overlord
-	overlordHost string
-	cfg          worker.Config
+	// Client that connects to coordinator
+	oClient *CoordinatorClient
+	// Raw address of coordinator
+	coordinatorHost string
+	cfg             worker.Config
 	// Rooms map : RoomID -> Room
 	rooms map[string]*room.Room
 	// ID of the current server globalwise
@@ -40,68 +38,92 @@ type Handler struct {
 	onlineStorage *storage.Client
 	// sessions handles all sessions server is handler (key is sessionID)
 	sessions map[string]*Session
+
+	w *Worker
 }
 
 // NewHandler returns a new server
-func NewHandler(cfg worker.Config) *Handler {
+func NewHandler(cfg worker.Config, wrk *Worker) *Handler {
 	// Create offline storage folder
 	createOfflineStorage()
 
 	// Init online storage
 	onlineStorage := storage.NewInitClient()
 	return &Handler{
-		rooms:         map[string]*room.Room{},
-		sessions:      map[string]*Session{},
-		overlordHost:  cfg.OverlordAddress,
-		cfg:           cfg,
-		onlineStorage: onlineStorage,
+		rooms:           map[string]*room.Room{},
+		sessions:        map[string]*Session{},
+		coordinatorHost: cfg.Worker.Network.CoordinatorAddress,
+		cfg:             cfg,
+		onlineStorage:   onlineStorage,
+		w:               wrk,
 	}
 }
 
 // Run starts a Handler running logic
 func (h *Handler) Run() {
+	conf := h.cfg.Worker.Network
 	for {
-		oClient, err := setupOverlordConnection(h.overlordHost, h.cfg.Zone)
+		conn, err := setupCoordinatorConnection(conf.CoordinatorAddress, conf.Zone, h.cfg)
 		if err != nil {
-			log.Printf("Cannot connect to overlord. %v Retrying...", err)
+			log.Printf("Cannot connect to coordinator. %v Retrying...", err)
 			time.Sleep(time.Second)
 			continue
 		}
+		log.Printf("[worker] connected to: %v", conf.CoordinatorAddress)
 
-		h.oClient = oClient
-		log.Println("Connected to overlord successfully.", oClient, err)
+		h.oClient = conn
 		go h.oClient.Heartbeat()
-		h.RouteOverlord()
+		h.routes()
 		h.oClient.Listen()
-		// If cannot listen, reconnect to overlord
+		// If cannot listen, reconnect to coordinator
 	}
 }
 
-func setupOverlordConnection(ohost string, zone string) (*OverlordClient, error) {
-	var scheme string
+func (h *Handler) RequestConfig() {
+	log.Printf("[worker] asking for a config...")
+	response := h.oClient.SyncSend(api.ConfigPacket())
+	conf := worker.EmptyConfig()
+	conf.Deserialize([]byte(response.Data))
+	log.Printf("[worker] pulled config: %+v", conf)
+}
 
-	if *config.Mode == config.ProdEnv || *config.Mode == config.StagingEnv {
+func (h *Handler) Prepare() {
+	if !h.cfg.Emulator.Libretro.Cores.Repo.Sync {
+		return
+	}
+
+	log.Printf("Starting Libretro cores sync...")
+	coreManager := remotehttp.NewRemoteHttpManager(h.cfg.Emulator.Libretro)
+	if err := coreManager.Sync(); err != nil {
+		log.Printf("error: cores sync has failed, %v", err)
+	}
+}
+
+func setupCoordinatorConnection(ohost string, zone string, cfg worker.Config) (*CoordinatorClient, error) {
+	var scheme string
+	env := cfg.Environment.Get()
+	if env.AnyOf(environment.Production, environment.Staging) {
 		scheme = "wss"
 	} else {
 		scheme = "ws"
 	}
 
-	overlordURL := url.URL{
+	coordinatorURL := url.URL{
 		Scheme:   scheme,
 		Host:     ohost,
 		Path:     "/wso",
 		RawQuery: "zone=" + zone,
 	}
-	log.Println("Worker connecting to overlord:", overlordURL.String())
+	log.Println("Worker connecting to coordinator:", coordinatorURL.String())
 
-	conn, err := createOverlordConnection(&overlordURL)
+	conn, err := createCoordinatorConnection(&coordinatorURL)
 	if err != nil {
 		return nil, err
 	}
-	return NewOverlordClient(conn), nil
+	return NewCoordinatorClient(conn), nil
 }
 
-func createOverlordConnection(ourl *url.URL) (*websocket.Conn, error) {
+func createCoordinatorConnection(ourl *url.URL) (*websocket.Conn, error) {
 	var d websocket.Dialer
 	if ourl.Scheme == "wss" {
 		d = websocket.Dialer{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
@@ -117,7 +139,7 @@ func createOverlordConnection(ourl *url.URL) (*websocket.Conn, error) {
 	return ws, nil
 }
 
-func (h *Handler) GetOverlordClient() *OverlordClient {
+func (h *Handler) GetCoordinatorClient() *CoordinatorClient {
 	return h.oClient
 }
 
@@ -137,7 +159,7 @@ func (h *Handler) detachPeerConn(pc *webrtc.WebRTC) {
 			room.Close()
 			// Signal end of input Channel
 			log.Println("Signal input chan")
-			pc.InputChannel <- -1
+			pc.InputChannel <- []byte{0xFF, 0xFF}
 			close(pc.InputChannel)
 		}
 	}
@@ -170,12 +192,12 @@ func (h *Handler) detachRoom(roomID string) {
 
 // createNewRoom creates a new room
 // Return nil in case of room is existed
-func (h *Handler) createNewRoom(gameName string, roomID string, videoEncoderType string) *room.Room {
+func (h *Handler) createNewRoom(game games.GameMetadata, roomID string, videoCodec encoder.VideoCodec) *room.Room {
 	// If the roomID is empty,
 	// or the roomID doesn't have any running sessions (room was closed)
 	// we spawn a new room
 	if roomID == "" || !h.isRoomRunning(roomID) {
-		room := room.NewRoom(roomID, gameName, videoEncoderType, h.onlineStorage, h.cfg)
+		room := room.NewRoom(roomID, game, videoCodec, h.onlineStorage, h.cfg)
 		// TODO: Might have race condition
 		h.rooms[room.ID] = room
 		return room

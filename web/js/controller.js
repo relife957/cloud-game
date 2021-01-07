@@ -2,15 +2,23 @@
  * App controller module.
  * @version 1
  */
-/* const controller = */
 (() => {
-    // current app state
+    // application state
     let state;
+    let lastState;
 
     // flags
     // first user interaction
-    // used for mute/unmute
     let interacted = false;
+
+    const DIR = (() => {
+        return {
+            IDLE: 'idle',
+            UP: 'up',
+            DOWN: 'down',
+        }
+    })();
+    let prevDir = DIR.IDLE;
 
     // UI elements
     // use $element[0] for DOM element
@@ -18,19 +26,45 @@
     const menuScreen = $('#menu-screen');
     const helpOverlay = $('#help-overlay');
     const popupBox = $('#noti-box');
+    const playerIndex = document.getElementById('playeridx');
+
     // keymap
     const keyButtons = {};
     Object.keys(KEY).forEach(button => {
         keyButtons[KEY[button]] = $(`#btn-${KEY[button]}`);
     });
 
-    const setState = (newState) => {
-        log.debug(`[control] [s] ${state ? state.name : '???'} -> ${newState.name}`);
-        state = newState;
+    /**
+     * State machine transition.
+     * @param newState A new state strictly from app.state.*
+     * @example
+     * setState(app.state.eden)
+     */
+    const setState = (newState = app.state.eden) => {
+        if (newState === state) return;
+
+        const prevState = state;
+
+        // keep the current state intact for one of the "uber" states
+        if (state && state._uber) {
+            // if we are done with the uber state
+            if (lastState === newState) state = newState;
+            lastState = newState;
+        } else {
+            lastState = state
+            state = newState;
+        }
+
+        if (log.is(log.level.debug)) {
+            const previous = prevState ? prevState.name : '???';
+            const current = state ? state.name : '???';
+            const kept = lastState ? lastState.name : '???';
+
+            log.debug(`[state] ${previous} -> ${current} [${kept}]`);
+        }
     };
 
     const onGameRoomAvailable = () => {
-        keyButtons[KEY.JOIN].html('share');
         popup('Now you can share you game!');
     };
 
@@ -43,19 +77,19 @@
         }
     };
 
-    const onLatencyCheckRequest = (data) => {
-        popup('Ping check...');
-        const timeoutMs = 2000;
-        const maxTimeoutMs = timeoutMs > ajax.defaultTimeoutMs() ? timeoutMs : ajax.defaultTimeoutMs();
+    const onLatencyCheck = (data) => {
+        popup('Connecting to fastest server...');
+        const timeoutMs = 1111;
+        // deduplicate
+        const addresses = [...new Set(data.addresses || [])];
 
-        Promise.all((data.addresses || []).map(address => {
-            let beforeTime = Date.now();
-            return ajax.fetch(`${address}?_=${beforeTime}`, {method: "GET", redirect: "follow"}, timeoutMs)
-                .then(() => ({[address]: Date.now() - beforeTime}), () => ({[address]: maxTimeoutMs}));
-        })).then(results => {
-            // const latencies = Object.assign({}, ...results);
-            const latencies = {};
-            results.map(latency => Object.keys(latency).forEach(address => latencies[address] = latency[address]));
+        Promise.all(addresses.map(address => {
+            const start = Date.now();
+            return ajax.fetch(`${address}?_=${start}`, {method: "GET", redirect: "follow"}, timeoutMs)
+                .then(() => ({[address]: Date.now() - start}))
+                .catch(() => ({[address]: 9999}));
+        })).then(servers => {
+            const latencies = Object.assign({}, ...servers);
             log.info('[ping] <->', latencies);
             socket.latency(latencies, data.packetId);
         });
@@ -64,50 +98,38 @@
     const helpScreen = {
         // don't call $ if holding the button
         shown: false,
-        // undo the state when release the button
-        prevState: null,
         // use function () if you need "this"
-        show: function (show) {
+        show: function (show, event) {
             if (this.shown === show) return;
 
-            // hack
-            if (state === app.state.game || this.prevState === app.state.game) {
+            if (state === app.state.game) {
                 gameScreen.toggle(!show);
             } else {
-                keyButtons[KEY.SAVE].toggle(show);
-                keyButtons[KEY.LOAD].toggle(show);
                 menuScreen.toggle(!show);
             }
+
+            keyButtons[KEY.SAVE].toggle(show);
+            keyButtons[KEY.LOAD].toggle(show);
+
             helpOverlay.toggle(show);
 
             this.shown = show;
 
-            if (show) {
-                this.prevState = state;
-                setState(app.state.help);
-            } else {
-                setState(this.prevState);
-            }
+            if (event) event.pub(HELP_OVERLAY_TOGGLED, {shown: show});
         }
     };
 
     const showMenuScreen = () => {
-        // clear scenes
+        log.debug('[control] loading menu screen');
+
         gameScreen.hide();
-        menuScreen.hide();
-        gameList.hide();
         keyButtons[KEY.SAVE].hide();
         keyButtons[KEY.LOAD].hide();
-        keyButtons[KEY.JOIN].html('play');
 
-        // show menu scene
-        gameScreen.show().delay(0).fadeOut(0, () => {
-            log.debug('[control] loading menu screen');
-            menuScreen.fadeIn(0, () => {
-                gameList.show();
-                setState(app.state.menu);
-            });
-        });
+        gameList.show();
+        menuScreen.show();
+
+        setState(app.state.menu);
     };
 
     const startGame = () => {
@@ -121,10 +143,7 @@
             return;
         }
 
-        //const el = document.createElement('textarea');
-        const playeridx = parseInt($('#playeridx').val(), 10) - 1
-
-        log.info('[control] starting game screen');
+        log.info('[control] game start');
 
         setState(app.state.game);
 
@@ -145,7 +164,7 @@
         // currently it's a game with the index 1
         // on the server this game is ignored and the actual game will be extracted from the share link
         // so there's no point in doing this and this' really confusing
-        socket.startGame(gameList.getCurrentGame(), env.isMobileDevice(), room.getId(), playeridx);
+        socket.startGame(gameList.getCurrentGame(), env.isMobileDevice(), room.getId(), +playerIndex.value - 1);
 
         // clear menu screen
         input.poll().disable();
@@ -157,24 +176,46 @@
         input.poll().enable();
     };
 
-    // !to add debounce
-    const popup = (msg) => {
-        popupBox.html(msg);
-        popupBox.fadeIn().delay(0).fadeOut();
-    };
+    const saveGame = utils.debounce(socket.saveGame, 1000);
+    const loadGame = utils.debounce(socket.loadGame, 1000);
 
+    const _popup = (message) => popupBox.html(message).fadeIn().fadeOut();
+    const popup = utils.throttle(_popup, 1000);
+
+    const _dpadArrowKeys = [KEY.UP, KEY.DOWN, KEY.LEFT, KEY.RIGHT];
+
+    // pre-state key press handler
     const onKeyPress = (data) => {
-        keyButtons[data.key].addClass('pressed');
+        const button = keyButtons[data.key];
 
-        if (KEY.HELP === data.key) helpScreen.show(true);
+        if (_dpadArrowKeys.includes(data.key)) {
+            button.addClass('dpad-pressed');
+        } else {
+            if (button) button.addClass('pressed');
+        }
+
+        if (state !== app.state.settings) {
+            if (KEY.HELP === data.key) helpScreen.show(true, event);
+        }
 
         state.keyPress(data.key);
     };
 
-    const onKeyRelease = (data) => {
-        keyButtons[data.key].removeClass('pressed');
+    // pre-state key release handler
+    const onKeyRelease = data => {
+        const button = keyButtons[data.key];
 
-        if (KEY.HELP === data.key) helpScreen.show(false);
+        if (!button) return;
+
+        if (_dpadArrowKeys.includes(data.key)) {
+            button.removeClass('dpad-pressed');
+        } else {
+            if (button) button.removeClass('pressed');
+        }
+
+        if (state !== app.state.settings) {
+            if (KEY.HELP === data.key) helpScreen.show(false, event);
+        }
 
         // maybe move it somewhere
         if (!interacted) {
@@ -183,50 +224,85 @@
             interacted = true;
         }
 
+        // change app state if settings
+        if (KEY.SETTINGS === data.key) setState(app.state.settings);
+
         state.keyRelease(data.key);
     };
 
-    const updatePlayerIndex = (idx) => {
-        var slider = document.getElementById('playeridx');
-        slider.value = idx + 1;
+    const updatePlayerIndex = idx => {
+        playerIndex.value = idx + 1;
         socket.updatePlayerIndex(idx);
     };
 
+    // noop function for the state
+    const _nil = () => {
+    }
+
+    const onAxisChanged = (data) => {
+        // maybe move it somewhere
+        if (!interacted) {
+            // unmute when there is user interaction
+            gameScreen[0].muted = false;
+            interacted = true;
+        }
+
+        state.axisChanged(data.id, data.value);
+    };
+
+    const handleToggle = () => {
+        var toggle = document.getElementById('dpad-toggle');
+        toggle.checked = !toggle.checked;
+        event.pub(DPAD_TOGGLE, {checked: toggle.checked});
+    };
 
     const app = {
         state: {
             eden: {
                 name: 'eden',
-                keyPress: () => {
-                },
-                keyRelease: () => {
-                },
-                menuReady: () => {
-                    showMenuScreen()
-                }
+                axisChanged: _nil,
+                keyPress: _nil,
+                keyRelease: _nil,
+                menuReady: showMenuScreen
             },
 
-            help: {
-                name: 'help',
-                keyPress: () => {
+            settings: {
+                _uber: true,
+                name: 'settings',
+                axisChanged: _nil,
+                keyPress: _nil,
+                keyRelease: key => {
+                    if (key === KEY.SETTINGS) {
+                        const isSettingsOpened = settings.ui.toggle();
+                        if (!isSettingsOpened) setState(lastState);
+                    }
                 },
-                keyRelease: () => {
-                },
-                menuReady: () => {
-                    // show silently
-                    gameScreen.hide();
-                    menuScreen.hide();
-                    gameList.hide();
-                    keyButtons[KEY.JOIN].html('play');
-
-                    gameList.show();
-
-                    helpScreen.prevState = app.state.menu;
-                }
+                menuReady: showMenuScreen
             },
 
             menu: {
                 name: 'menu',
+                axisChanged: (id, value) => {
+                    if (id === 1) { // Left Stick, Y Axis
+                        let dir = DIR.IDLE;
+                        if (value < -0.5) dir = DIR.UP;
+                        if (value > 0.5) dir = DIR.DOWN;
+                        if (dir !== prevDir) {
+                            prevDir = dir;
+                            switch (dir) {
+                                case DIR.IDLE:
+                                    gameList.stopGamePickerTimer();
+                                    break;
+                                case DIR.UP:
+                                    gameList.startGamePickerTimer(true);
+                                    break;
+                                case DIR.DOWN:
+                                    gameList.startGamePickerTimer(false);
+                                    break;
+                            }
+                        }
+                    }
+                },
                 keyPress: (key) => {
                     switch (key) {
                         case KEY.UP:
@@ -254,38 +330,47 @@
                             popup('You are already in menu screen!');
                             break;
                         case KEY.LOAD:
-                            popup('Lets play to load game!');
+                            popup('Loading the game.');
                             break;
                         case KEY.SAVE:
-                            popup('Lets play to save game!');
+                            popup('Saving the game.');
+                            break;
+                        case KEY.STATS:
+                            event.pub(STATS_TOGGLE);
+                            break;
+                        case KEY.SETTINGS:
+                            break;
+                        case KEY.DTOGGLE:
+                            handleToggle();
                             break;
                     }
                 },
-                menuReady: () => {
-                }
+                menuReady: _nil
             },
 
             game: {
                 name: 'game',
-                keyPress: (key) => {
+                axisChanged: (id, value) => {
+                    input.setAxisChanged(id, value);
+                },
+                keyPress: key => {
                     input.setKeyState(key, true);
                 },
                 keyRelease: function (key) {
                     input.setKeyState(key, false);
 
                     switch (key) {
-                        // nani? why join / copy switch, it's confusing. Me: It's because of the original design to update label only :-s.
                         case KEY.JOIN: // or SHARE
                             // save when click share
-                            event.pub(KEY_PRESSED, {key: KEY.SAVE})
+                            saveGame();
                             room.copyToClipboard();
-                            popup('Copy link to clipboard!');
+                            popup('Shared link copied to the clipboard!');
                             break;
                         case KEY.SAVE:
-                            socket.saveGame();
+                            saveGame();
                             break;
                         case KEY.LOAD:
-                            socket.loadGame();
+                            loadGame();
                             break;
                         case KEY.FULL:
                             env.display().toggleFullscreen(gameScreen.height() !== window.innerHeight, gameScreen[0]);
@@ -305,6 +390,11 @@
                             updatePlayerIndex(3);
                             break;
 
+                        // toggle multitap
+                        case KEY.MULTITAP:
+                            socket.toggleMultitap();
+                            break;
+
                         // quit
                         case KEY.QUIT:
                             input.poll().disable();
@@ -315,13 +405,18 @@
 
                             popup('Quit!');
 
-                            location.reload();
+                            window.location = window.location.pathname;
+                            break;
+
+                        case KEY.STATS:
+                            event.pub(STATS_TOGGLE);
+                            break;
+                        case KEY.DTOGGLE:
+                            handleToggle();
                             break;
                     }
-
                 },
-                menuReady: () => {
-                }
+                menuReady: _nil
             }
         }
     };
@@ -330,17 +425,19 @@
     event.sub(GAME_ROOM_AVAILABLE, onGameRoomAvailable, 2);
     event.sub(GAME_SAVED, () => popup('Saved'));
     event.sub(GAME_LOADED, () => popup('Loaded'));
-    event.sub(GAME_PLAYER_IDX, (idx) => popup(parseInt(idx)+1));
+    event.sub(GAME_PLAYER_IDX, idx => popup(+idx + 1));
 
     event.sub(MEDIA_STREAM_INITIALIZED, (data) => {
         rtcp.start(data.stunturn);
         gameList.set(data.games);
     });
     event.sub(MEDIA_STREAM_SDP_AVAILABLE, (data) => rtcp.setRemoteDescription(data.sdp, gameScreen[0]));
+    event.sub(MEDIA_STREAM_CANDIDATE_ADD, (data) => rtcp.addCandidate(data.candidate));
+    event.sub(MEDIA_STREAM_CANDIDATE_FLUSH, () => rtcp.flushCandidate());
     event.sub(MEDIA_STREAM_READY, () => rtcp.start());
     event.sub(CONNECTION_READY, onConnectionReady);
     event.sub(CONNECTION_CLOSED, () => input.poll().disable());
-    event.sub(LATENCY_CHECK_REQUESTED, onLatencyCheckRequest);
+    event.sub(LATENCY_CHECK_REQUESTED, onLatencyCheck);
     event.sub(GAMEPAD_CONNECTED, () => popup('Gamepad connected'));
     event.sub(GAMEPAD_DISCONNECTED, () => popup('Gamepad disconnected'));
     // touch stuff
@@ -350,8 +447,22 @@
     event.sub(KEY_PRESSED, onKeyPress);
     event.sub(KEY_RELEASED, onKeyRelease);
     event.sub(KEY_STATE_UPDATED, data => rtcp.input(data));
+    event.sub(SETTINGS_CHANGED, () => popup('Settings have been updated'));
+    event.sub(SETTINGS_CLOSED, () => {
+        state.keyRelease(KEY.SETTINGS);
+    });
+    event.sub(AXIS_CHANGED, onAxisChanged);
+    event.sub(CONTROLLER_UPDATED, data => rtcp.input(data));
+
+    // game screen stuff
+    gameScreen.on('loadstart', () => {
+        gameScreen[0].volume = 0.5;
+        gameScreen[0].poster = '/static/img/screen_loading.gif';
+    });
+    gameScreen.on('canplay', () => {
+        gameScreen[0].poster = '';
+    });
 
     // initial app state
     setState(app.state.eden);
-
-})($, document, event, env, gameList, input, KEY, log, room);
+})($, document, event, env, gameList, input, KEY, log, room, settings, socket, stats, utils);

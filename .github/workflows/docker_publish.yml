@@ -1,0 +1,28 @@
+# ------------------------------------------------------------------------
+#  Publish Docker image from the current snapshot into Github repository
+# ------------------------------------------------------------------------
+
+name: publish
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+
+jobs:
+  docker-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: docker/build-push-action@v1
+        with:
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          add_git_labels: true
+          tag_with_ref: true
+
+          registry: docker.pkg.github.com
+          repository: ${{ github.REPOSITORY }}/cloud-game

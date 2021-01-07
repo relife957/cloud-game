@@ -2,15 +2,20 @@ package nanoarch
 
 /*
 #include "libretro.h"
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 
+void coreLog(enum retro_log_level level, const char *msg);
+
 void bridge_retro_init(void *f) {
+	coreLog(RETRO_LOG_INFO, "[Libretro] Initialization...\n");
 	return ((void (*)(void))f)();
 }
 
 void bridge_retro_deinit(void *f) {
+	coreLog(RETRO_LOG_INFO, "[Libretro] Deinitialiazation...\n");
 	return ((void (*)(void))f)();
 }
 
@@ -51,10 +56,12 @@ void bridge_retro_set_audio_sample_batch(void *f, void *callback) {
 }
 
 bool bridge_retro_load_game(void *f, struct retro_game_info *gi) {
+  coreLog(RETRO_LOG_INFO, "[Libretro] Loading the game...\n");
   return ((bool (*)(struct retro_game_info *))f)(gi);
 }
 
 void bridge_retro_unload_game(void *f) {
+	coreLog(RETRO_LOG_INFO, "[Libretro] Unloading the game...\n");
 	return ((void (*)(void))f)();
 }
 
@@ -80,6 +87,10 @@ bool bridge_retro_serialize(void *f, void *data, size_t size) {
 
 bool bridge_retro_unserialize(void *f, void *data, size_t size) {
   return ((bool (*)(void*, size_t))f)(data, size);
+}
+
+void bridge_retro_set_controller_port_device(void *f, unsigned port, unsigned device) {
+  return ((void (*)(unsigned, unsigned))f)(port, device);
 }
 
 bool coreEnvironment_cgo(unsigned cmd, void *data) {
@@ -119,9 +130,75 @@ void coreLog_cgo(enum retro_log_level level, const char *fmt, ...) {
 	vsnprintf(msg, sizeof(msg), fmt, va);
 	va_end(va);
 
-	void coreLog(enum retro_log_level level, const char *msg);
 	coreLog(level, msg);
 }
 
+uintptr_t coreGetCurrentFramebuffer_cgo() {
+	uintptr_t coreGetCurrentFramebuffer();
+	return coreGetCurrentFramebuffer();
+}
+
+retro_proc_address_t coreGetProcAddress_cgo(const char *sym) {
+	retro_proc_address_t coreGetProcAddress(const char *sym);
+	return coreGetProcAddress(sym);
+}
+
+void bridge_context_reset(retro_hw_context_reset_t f) {
+	f();
+}
+
+void initVideo_cgo() {
+	void initVideo();
+	return initVideo();
+}
+
+void deinitVideo_cgo() {
+	void deinitVideo();
+	return deinitVideo();
+}
+
+void* function;
+pthread_t thread;
+int initialized = 0;
+pthread_mutex_t run_mutex;
+pthread_cond_t run_cv;
+pthread_mutex_t done_mutex;
+pthread_cond_t done_cv;
+
+void *run_loop(void *unused) {
+	pthread_mutex_lock(&done_mutex);
+	pthread_mutex_lock(&run_mutex);
+	pthread_cond_signal(&done_cv);
+	pthread_mutex_unlock(&done_mutex);
+	while(1) {
+		pthread_cond_wait(&run_cv, &run_mutex);
+		((void (*)(void))function)();
+		pthread_mutex_lock(&done_mutex);
+		pthread_cond_signal(&done_cv);
+		pthread_mutex_unlock(&done_mutex);
+	}
+	pthread_mutex_unlock(&run_mutex);
+}
+
+void bridge_execute(void *f) {
+	if (!initialized) {
+		initialized = 1;
+		pthread_mutex_init(&run_mutex, NULL);
+		pthread_cond_init(&run_cv, NULL);
+		pthread_mutex_init(&done_mutex, NULL);
+		pthread_cond_init(&done_cv, NULL);
+		pthread_mutex_lock(&done_mutex);
+		pthread_create(&thread, NULL, run_loop, NULL);
+		pthread_cond_wait(&done_cv, &done_mutex);
+		pthread_mutex_unlock(&done_mutex);
+	}
+	pthread_mutex_lock(&run_mutex);
+	pthread_mutex_lock(&done_mutex);
+	function = f;
+	pthread_cond_signal(&run_cv);
+	pthread_mutex_unlock(&run_mutex);
+	pthread_cond_wait(&done_cv, &done_mutex);
+	pthread_mutex_unlock(&done_mutex);
+}
 */
 import "C"

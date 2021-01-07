@@ -19,15 +19,14 @@ check: fmt
 
 dep:
 	go mod download
-#	go mod vendor
 #	go mod tidy
 
 # NOTE: there is problem with go mod vendor when it delete github.com/gen2brain/x264-go/x264c causing unable to build. https://github.com/golang/go/issues/26366
 #build.cross: build
-#	CGO_ENABLED=1 GOOS=darwin GOARC=amd64 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/overlord-darwin ./cmd/overlord
-#	CGO_ENABLED=1 GOOS=darwin GOARC=amd64 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/overworker-darwin ./cmd/overworker
-#	CC=arm-linux-musleabihf-gcc GOOS=linux GOARC=amd64 CGO_ENABLED=1 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/overlord-linu ./cmd/overlord
-#	CC=arm-linux-musleabihf-gcc GOOS=linux GOARC=amd64 CGO_ENABLED=1 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/overworker-linux ./cmd/overworker
+#	CGO_ENABLED=1 GOOS=darwin GOARC=amd64 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/coordinator-darwin ./cmd/coordinator
+#	CGO_ENABLED=1 GOOS=darwin GOARC=amd64 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/worker-darwin ./cmd/worker
+#	CC=arm-linux-musleabihf-gcc GOOS=linux GOARC=amd64 CGO_ENABLED=1 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/coordinator-linu ./cmd/coordinator
+#	CC=arm-linux-musleabihf-gcc GOOS=linux GOARC=amd64 CGO_ENABLED=1 go build --ldflags '-linkmode external -extldflags "-static"' -o bin/worker-linux ./cmd/worker
 
 # A user can invoke tests in different ways:
 #  - make test runs all tests;
@@ -58,26 +57,82 @@ cover:
 clean:
 	@rm -rf bin
 	@rm -rf build
-	@go clean
+	@go clean ./cmd/*
+
+build:
+	go build -a -tags netgo -ldflags '-w' -o bin/coordinator ./cmd/coordinator
+	go build -a -tags netgo -ldflags '-w' -o bin/worker ./cmd/worker
 
 dev.tools:
 	./hack/scripts/install_tools.sh
 
-dev.build: compile
-	go build -a -tags netgo -ldflags '-w' -o bin/overlord ./cmd/overlord
-	go build -a -tags netgo -ldflags '-w' -o bin/overworker ./cmd/overworker
+dev.build: compile build
 
 dev.build-local:
-	go build -o bin/overlord ./cmd/overlord
-	go build -o bin/overworker ./cmd/overworker
+	go build -o bin/coordinator ./cmd/coordinator
+	go build -o bin/worker ./cmd/worker
 
 dev.run: dev.build-local
-	./bin/overlord --v=5 &
-	./bin/overworker --overlordhost localhost:8000
+	./bin/coordinator --v=5 &
+	./bin/worker --coordinatorhost localhost:8000
 
 dev.run-docker:
-	docker build . -t cloud-game-local
-	docker stop cloud-game-local || true
-	docker rm cloud-game-local || true
-	# Overlord and worker should be run separately.
-	docker run --privileged -v $PWD/games:/cloud-game/games -d --name cloud-game-local -p 8000:8000 -p 9000:9000 cloud-game-local bash -c "overlord --v=5 & overworker --overlordhost localhost:8000"
+	docker rm cloud-game-local -f || true
+	CLOUD_GAME_GAMES_PATH=$(PWD)/assets/games docker-compose up --build
+
+# RELEASE
+# Builds the app for new release.
+#
+# Folder structure:
+#   - assets/
+#   	- games/ (shared between both executables)
+#   	- emulator/libretro/cores/ (filtered by extension)
+#   - web/
+#   - coordinator
+#   - worker
+#
+# Config params:
+# - RELEASE_DIR: the name of the output folder (default: release).
+# - DLIB_TOOL: the name of a dynamic lib copy tool (with params) (e.g., ldd -x -y; defalut: ldd).
+# - DLIB_SEARCH_PATTERN: a grep filter of the output of the DLIB_TOOL (e.g., mylib.so; default: .*so).
+#   Be aware that this search pattern will return only matched regular expression part and not the whole line.
+#   de. -> abc def ghj -> def
+#   Makefile special symbols should be escaped with \.
+# - DLIB_ALTER: a special flag to use altered dynamic copy lib tool for macOS only.
+# - CORE_EXT: a glob pattern to filter the cores that are copied into the release.
+#
+# Example:
+#   make release DLIB_TOOL="ldd -x" DLIB_SEARCH_PATTERN=/usr/lib.*\\\\s CORE_EXT=*.so
+#
+RELEASE_DIR ?= release
+DLIB_TOOL ?= ldd
+DLIB_SEARCH_PATTERN ?= .*so
+DLIB_ALTER ?= false
+CORE_EXT ?= *_libretro.so
+COORDINATOR_DIR = ./$(RELEASE_DIR)
+WORKER_DIR = ./$(RELEASE_DIR)
+CORES_DIR = assets/cores
+GAMES_DIR = assets/games
+.PHONY: release
+.SILENT: release
+release: clean build
+	rm -rf ./$(RELEASE_DIR) && mkdir ./$(RELEASE_DIR)
+	mkdir -p $(COORDINATOR_DIR) && mkdir -p $(WORKER_DIR)
+	cp ./bin/coordinator $(COORDINATOR_DIR) && cp ./bin/worker $(WORKER_DIR)
+	chmod +x $(COORDINATOR_DIR)/coordinator $(WORKER_DIR)/worker
+    ifeq ($(DLIB_ALTER),false)
+		for bin in $$($(DLIB_TOOL) $(WORKER_DIR)/worker | grep -o $(DLIB_SEARCH_PATTERN)); \
+			do cp -v "$$bin" $(WORKER_DIR); \
+		done
+    else
+		$(DLIB_TOOL) $(WORKER_DIR) $(WORKER_DIR)/worker
+    endif
+	cp -R ./web $(COORDINATOR_DIR)
+	mkdir -p $(WORKER_DIR)/$(GAMES_DIR)
+    ifneq (,$(wildcard ./$(GAMES_DIR)))
+		cp -R ./$(GAMES_DIR) $(WORKER_DIR)/assets
+    endif
+	mkdir -p $(WORKER_DIR)/$(CORES_DIR)
+    ifneq (,$(wildcard ./$(CORES_DIR)/$(CORE_EXT)))
+		cp -R ./$(CORES_DIR)/$(CORE_EXT) $(WORKER_DIR)/$(CORES_DIR)
+    endif

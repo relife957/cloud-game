@@ -3,23 +3,26 @@ package nanoarch
 import (
 	"bufio"
 	"errors"
-	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/user"
+	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
-	"github.com/giongto35/cloud-game/pkg/config"
-	"github.com/giongto35/cloud-game/pkg/emulator/libretro/image"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator/graphics"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator/image"
+	"github.com/giongto35/cloud-game/v2/pkg/emulator/libretro/core"
+	"github.com/giongto35/cloud-game/v2/pkg/thread"
 )
 
 /*
 #include "libretro.h"
-#cgo LDFLAGS: -ldl
 #include <stdlib.h>
 #include <stdio.h>
-#include <dlfcn.h>
 #include <string.h>
 
 void bridge_retro_init(void *f);
@@ -41,6 +44,7 @@ void* bridge_retro_get_memory_data(void *f, unsigned id);
 bool bridge_retro_serialize(void *f, void *data, size_t size);
 bool bridge_retro_unserialize(void *f, void *data, size_t size);
 size_t bridge_retro_serialize_size(void *f);
+void bridge_retro_set_controller_port_device(void *f, unsigned port, unsigned device);
 
 bool coreEnvironment_cgo(unsigned cmd, void *data);
 void coreVideoRefresh_cgo(void *data, unsigned width, unsigned height, size_t pitch);
@@ -49,37 +53,75 @@ void coreAudioSample_cgo(int16_t left, int16_t right);
 size_t coreAudioSampleBatch_cgo(const int16_t *data, size_t frames);
 int16_t coreInputState_cgo(unsigned port, unsigned device, unsigned index, unsigned id);
 void coreLog_cgo(enum retro_log_level level, const char *msg);
+uintptr_t coreGetCurrentFramebuffer_cgo();
+retro_proc_address_t coreGetProcAddress_cgo(const char *sym);
+
+void bridge_context_reset(retro_hw_context_reset_t f);
+
+void initVideo_cgo();
+void deinitVideo_cgo();
+void bridge_execute(void *f);
 */
 import "C"
 
 var mu sync.Mutex
 
 var video struct {
-	program uint32
-	vao     uint32
-	pitch   uint32
-	pixFmt  uint32
-	pixType uint32
-	bpp     uint32
+	pitch    uint32
+	pixFmt   uint32
+	bpp      uint32
+	rotation image.Angle
+
+	baseWidth  int32
+	baseHeight int32
+	maxWidth   int32
+	maxHeight  int32
+
+	hw            *C.struct_retro_hw_render_callback
+	isGl          bool
+	autoGlContext bool
 }
 
-const bufSize = 1024 * 4
-const joypadNumKeys = int(C.RETRO_DEVICE_ID_JOYPAD_R3 + 1)
+// default core pix format converter
+var pixelFormatConverterFn = image.Rgb565
+var rotationFn = image.GetRotation(image.Angle(0))
 
-var joy [joypadNumKeys]bool
-var ewidth, eheight int
+//const joypadNumKeys = int(C.RETRO_DEVICE_ID_JOYPAD_R3 + 1)
+//var joy [joypadNumKeys]bool
+
+var isGlAllowed bool
+var usesLibCo bool
+var coreConfig ConfigProperties
+
+var multitap struct {
+	supported bool
+	enabled   bool
+	value     C.unsigned
+}
+
+var systemDirectory = C.CString("./pkg/emulator/libretro/system")
+var saveDirectory = C.CString(".")
+var currentUser *C.char
+
+var seed = rand.New(rand.NewSource(time.Now().UnixNano())).Uint32()
 
 var bindKeysMap = map[int]int{
 	C.RETRO_DEVICE_ID_JOYPAD_A:      0,
 	C.RETRO_DEVICE_ID_JOYPAD_B:      1,
 	C.RETRO_DEVICE_ID_JOYPAD_X:      2,
 	C.RETRO_DEVICE_ID_JOYPAD_Y:      3,
-	C.RETRO_DEVICE_ID_JOYPAD_SELECT: 4,
-	C.RETRO_DEVICE_ID_JOYPAD_START:  5,
-	C.RETRO_DEVICE_ID_JOYPAD_UP:     6,
-	C.RETRO_DEVICE_ID_JOYPAD_DOWN:   7,
-	C.RETRO_DEVICE_ID_JOYPAD_LEFT:   8,
-	C.RETRO_DEVICE_ID_JOYPAD_RIGHT:  9,
+	C.RETRO_DEVICE_ID_JOYPAD_L:      4,
+	C.RETRO_DEVICE_ID_JOYPAD_R:      5,
+	C.RETRO_DEVICE_ID_JOYPAD_SELECT: 6,
+	C.RETRO_DEVICE_ID_JOYPAD_START:  7,
+	C.RETRO_DEVICE_ID_JOYPAD_UP:     8,
+	C.RETRO_DEVICE_ID_JOYPAD_DOWN:   9,
+	C.RETRO_DEVICE_ID_JOYPAD_LEFT:   10,
+	C.RETRO_DEVICE_ID_JOYPAD_RIGHT:  11,
+	C.RETRO_DEVICE_ID_JOYPAD_R2:     12,
+	C.RETRO_DEVICE_ID_JOYPAD_L2:     13,
+	C.RETRO_DEVICE_ID_JOYPAD_R3:     14,
+	C.RETRO_DEVICE_ID_JOYPAD_L3:     15,
 }
 
 type CloudEmulator interface {
@@ -88,27 +130,51 @@ type CloudEmulator interface {
 	LoadGame() error
 	GetHashPath() string
 	Close()
+	ToggleMultitap() error
 }
 
 //export coreVideoRefresh
 func coreVideoRefresh(data unsafe.Pointer, width C.unsigned, height C.unsigned, pitch C.size_t) {
 	// some cores can return nothing
+	// !to add duplicate if can dup
 	if data == nil {
 		return
 	}
 
+	// divide by 8333 to give us the equivalent of a 120fps resolution
+	timestamp := uint32(time.Now().UnixNano()/8333) + seed
+	// if Libretro renders frame with OpenGL context
+	isOpenGLRender := data == C.RETRO_HW_FRAME_BUFFER_VALID
+
 	// calculate real frame width in pixels from packed data (realWidth >= width)
 	packedWidth := int(uint32(pitch) / video.bpp)
-
-	// convert data from C
+	if packedWidth < 1 {
+		packedWidth = int(width)
+	}
+	// calculate space for the video frame
 	bytes := int(height) * packedWidth * int(video.bpp)
-	data_ := (*[1 << 30]byte)(data)[:bytes:bytes]
 
-	// image is resized here and push to channel. On the other side, images will be fan out
-	image.DrawRgbaImage(int(video.pixFmt), image.ScaleNearestNeighbour, int(width), int(height),
-		packedWidth, ewidth, eheight, int(video.bpp), data_, outputImg)
+	var data_ []byte
+	if isOpenGLRender {
+		data_ = graphics.ReadFramebuffer(bytes, int(width), int(height))
+	} else {
+		data_ = (*[1 << 30]byte)(data)[:bytes:bytes]
+	}
 
-	NAEmulator.imageChannel <- outputImg
+	// the image is being resized and de-rotated
+	image.DrawRgbaImage(
+		pixelFormatConverterFn,
+		rotationFn,
+		image.ScaleNearestNeighbour,
+		isOpenGLRender,
+		int(width), int(height), packedWidth, int(video.bpp),
+		data_,
+		outputImg,
+	)
+
+	// the image is pushed into a channel
+	// where it will be distributed with fan-out
+	NAEmulator.imageChannel <- GameFrame{Image: outputImg, Timestamp: timestamp}
 }
 
 //export coreInputPoll
@@ -117,32 +183,46 @@ func coreInputPoll() {
 
 //export coreInputState
 func coreInputState(port C.unsigned, device C.unsigned, index C.unsigned, id C.unsigned) C.int16_t {
+	if device == C.RETRO_DEVICE_ANALOG {
+		if index > C.RETRO_DEVICE_INDEX_ANALOG_RIGHT || id > C.RETRO_DEVICE_ID_ANALOG_Y {
+			return 0
+		}
+		axis := index*2 + id
+		for k := range NAEmulator.controllersMap {
+			value := NAEmulator.controllersMap[k][port].axes[axis]
+			if value != 0 {
+				return (C.int16_t)(value)
+			}
+		}
+	}
+
 	if id >= 255 || index > 0 || device != C.RETRO_DEVICE_JOYPAD {
 		return 0
 	}
 
-	// map from id to controll key
+	// map from id to control key
 	key, ok := bindKeysMap[int(id)]
 	if !ok {
 		return 0
 	}
 
 	// check if any player is pressing that key
-	for k := range NAEmulator.keysMap {
-		if ((NAEmulator.keysMap[k][port] >> uint(key)) & 1) == 1 {
+	for k := range NAEmulator.controllersMap {
+		if ((NAEmulator.controllersMap[k][port].keyState >> uint(key)) & 1) == 1 {
 			return 1
 		}
 	}
 	return 0
 }
 
-func audioWrite2(buf unsafe.Pointer, frames C.size_t) C.size_t {
+func audioWrite(buf unsafe.Pointer, frames C.size_t) C.size_t {
 	// !to make it mono/stereo independent
 	samples := int(frames) * 2
-	pcm := (*[1 << 30]int16)(buf)[:samples:samples]
+	pcm := (*[(1 << 30) - 1]int16)(buf)[:samples:samples]
 
 	p := make([]int16, samples)
-	// copy because pcm slice refer to buf underlying pointer, and buf pointer is the same in continuos frames
+	// copy because pcm slice refer to buf underlying pointer,
+	// and buf pointer is the same in continuous frames
 	copy(p, pcm)
 
 	select {
@@ -156,17 +236,27 @@ func audioWrite2(buf unsafe.Pointer, frames C.size_t) C.size_t {
 //export coreAudioSample
 func coreAudioSample(left C.int16_t, right C.int16_t) {
 	buf := []C.int16_t{left, right}
-	audioWrite2(unsafe.Pointer(&buf), 1)
+	audioWrite(unsafe.Pointer(&buf), 1)
 }
 
 //export coreAudioSampleBatch
 func coreAudioSampleBatch(data unsafe.Pointer, frames C.size_t) C.size_t {
-	return audioWrite2(data, frames)
+	return audioWrite(data, frames)
 }
 
 //export coreLog
-func coreLog(level C.enum_retro_log_level, msg *C.char) {
-	fmt.Print("[Log]: ", C.GoString(msg))
+func coreLog(_ C.enum_retro_log_level, msg *C.char) {
+	log.Printf("[Log] %v", C.GoString(msg))
+}
+
+//export coreGetCurrentFramebuffer
+func coreGetCurrentFramebuffer() C.uintptr_t {
+	return (C.uintptr_t)(graphics.GetGlFbo())
+}
+
+//export coreGetProcAddress
+func coreGetProcAddress(sym *C.char) C.retro_proc_address_t {
+	return (C.retro_proc_address_t)(graphics.GetGlProcAddress(C.GoString(sym)))
 }
 
 //export coreEnvironment
@@ -174,12 +264,15 @@ func coreEnvironment(cmd C.unsigned, data unsafe.Pointer) C.bool {
 	switch cmd {
 	case C.RETRO_ENVIRONMENT_GET_USERNAME:
 		username := (**C.char)(data)
-		currentUser, err := user.Current()
-		if err != nil {
-			*username = C.CString("")
-		} else {
-			*username = C.CString(currentUser.Username)
+		if currentUser == nil {
+			currentUserGo, err := user.Current()
+			if err != nil {
+				currentUser = C.CString("")
+			} else {
+				currentUser = C.CString(currentUserGo.Username)
+			}
 		}
+		*username = currentUser
 		break
 	case C.RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
 		cb := (*C.struct_retro_log_callback)(data)
@@ -190,25 +283,60 @@ func coreEnvironment(cmd C.unsigned, data unsafe.Pointer) C.bool {
 		*bval = C.bool(true)
 		break
 	case C.RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
-		format := (*C.enum_retro_pixel_format)(data)
-		if *format > C.RETRO_PIXEL_FORMAT_RGB565 {
-			return false
-		}
-		return videoSetPixelFormat(*format)
+		return videoSetPixelFormat(*(*C.enum_retro_pixel_format)(data))
 	case C.RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
 		path := (**C.char)(data)
-		*path = C.CString("./pkg/emulator/libretro/system")
+		*path = systemDirectory
 		return true
 	case C.RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
 		path := (**C.char)(data)
-		*path = C.CString(".")
+		*path = saveDirectory
 		return true
 	case C.RETRO_ENVIRONMENT_SHUTDOWN:
 		//window.SetShouldClose(true)
 		return true
+		/*
+			Sets screen rotation of graphics.
+			Valid values are 0, 1, 2, 3, which rotates screen by 0, 90, 180, 270 degrees
+			ccw respectively.
+		*/
+	case C.RETRO_ENVIRONMENT_SET_ROTATION:
+		setRotation(*(*int)(data) % 4)
+		return true
 	case C.RETRO_ENVIRONMENT_GET_VARIABLE:
 		variable := (*C.struct_retro_variable)(data)
-		fmt.Println("[Env]: get variable:", C.GoString(variable.key))
+		key := C.GoString(variable.key)
+		if val, ok := coreConfig[key]; ok {
+			log.Printf("[Env]: get variable: key:%v value:%v", key, C.GoString(val))
+			variable.value = val
+			return true
+		}
+		// fmt.Printf("[Env]: get variable: key:%v not found\n", key)
+		return false
+	case C.RETRO_ENVIRONMENT_SET_HW_RENDER:
+		video.isGl = isGlAllowed
+		if isGlAllowed {
+			video.hw = (*C.struct_retro_hw_render_callback)(data)
+			video.hw.get_current_framebuffer = (C.retro_hw_get_current_framebuffer_t)(C.coreGetCurrentFramebuffer_cgo)
+			video.hw.get_proc_address = (C.retro_hw_get_proc_address_t)(C.coreGetProcAddress_cgo)
+			return true
+		}
+		return false
+	case C.RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
+		if multitap.supported {
+			info := (*[100]C.struct_retro_controller_info)(data)
+			var i C.unsigned
+			for i = 0; unsafe.Pointer(info[i].types) != nil; i++ {
+				var j C.unsigned
+				types := (*[100]C.struct_retro_controller_description)(unsafe.Pointer(info[i].types))
+				for j = 0; j < info[i].num_types; j++ {
+					if C.GoString(types[j].desc) == "Multitap" {
+						multitap.value = types[j].id
+						return true
+					}
+				}
+			}
+		}
 		return false
 	default:
 		//fmt.Println("[Env]: command not implemented", cmd)
@@ -217,9 +345,54 @@ func coreEnvironment(cmd C.unsigned, data unsafe.Pointer) C.bool {
 	return true
 }
 
-func init() {
+//export initVideo
+func initVideo() {
+	var context graphics.Context
+	switch video.hw.context_type {
+	case C.RETRO_HW_CONTEXT_NONE:
+		context = graphics.CtxNone
+	case C.RETRO_HW_CONTEXT_OPENGL:
+		context = graphics.CtxOpenGl
+	case C.RETRO_HW_CONTEXT_OPENGLES2:
+		context = graphics.CtxOpenGlEs2
+	case C.RETRO_HW_CONTEXT_OPENGL_CORE:
+		context = graphics.CtxOpenGlCore
+	case C.RETRO_HW_CONTEXT_OPENGLES3:
+		context = graphics.CtxOpenGlEs3
+	case C.RETRO_HW_CONTEXT_OPENGLES_VERSION:
+		context = graphics.CtxOpenGlEsVersion
+	case C.RETRO_HW_CONTEXT_VULKAN:
+		context = graphics.CtxVulkan
+	case C.RETRO_HW_CONTEXT_DUMMY:
+		context = graphics.CtxDummy
+	default:
+		context = graphics.CtxUnknown
+	}
+
+	graphics.Init(graphics.Config{
+		Ctx: context,
+		W:   int(video.maxWidth),
+		H:   int(video.maxHeight),
+		Gl: graphics.GlConfig{
+			AutoContext:  video.autoGlContext,
+			VersionMajor: uint(video.hw.version_major),
+			VersionMinor: uint(video.hw.version_minor),
+			HasDepth:     bool(video.hw.depth),
+			HasStencil:   bool(video.hw.stencil),
+		},
+	})
+	C.bridge_context_reset(video.hw.context_reset)
 }
 
+//export deinitVideo
+func deinitVideo() {
+	C.bridge_context_reset(video.hw.context_destroy)
+	graphics.Deinit()
+	video.isGl = false
+	video.autoGlContext = false
+}
+
+var retroHandle unsafe.Pointer
 var retroInit unsafe.Pointer
 var retroDeinit unsafe.Pointer
 var retroAPIVersion unsafe.Pointer
@@ -234,47 +407,57 @@ var retroSetAudioSampleBatch unsafe.Pointer
 var retroRun unsafe.Pointer
 var retroLoadGame unsafe.Pointer
 var retroUnloadGame unsafe.Pointer
-var retroGetMemorySize unsafe.Pointer
-var retroGetMemoryData unsafe.Pointer
 var retroSerializeSize unsafe.Pointer
 var retroSerialize unsafe.Pointer
 var retroUnserialize unsafe.Pointer
+var retroSetControllerPortDevice unsafe.Pointer
 
-func coreLoad(pathNoExt string) {
+func coreLoad(meta emulator.Metadata) {
+	isGlAllowed = meta.IsGlAllowed
+	usesLibCo = meta.UsesLibCo
+	video.autoGlContext = meta.AutoGlContext
+	coreConfig = ScanConfigFile(meta.ConfigPath)
+
+	multitap.supported = meta.HasMultitap
+	multitap.enabled = false
+	multitap.value = 0
+
+	filePath := meta.LibPath
+	if arch, err := core.GetCoreExt(); err == nil {
+		filePath = filePath + arch.LibExt
+	} else {
+		log.Printf("warning: %v", err)
+	}
+
 	mu.Lock()
-	// Different OS requires different library, bruteforce till it finish
-	h := C.dlopen(C.CString(pathNoExt+".so"), C.RTLD_LAZY)
-
-	for _, ext := range config.EmulatorExtension {
-		pathWithExt := pathNoExt + ext
-		h = C.dlopen(C.CString(pathWithExt), C.RTLD_LAZY)
-		if h != nil {
-			break
+	var err error
+	retroHandle, err = loadLib(filePath)
+	// fallback to sequential lib loader (first successfully loaded)
+	if err != nil {
+		retroHandle, err = loadLibRollingRollingRolling(filePath)
+		if err != nil {
+			log.Fatalf("error core load: %s, %v", filePath, err)
 		}
 	}
 
-	if h == nil {
-		err := C.dlerror()
-		log.Fatalf("error loading %s, err %+v", pathNoExt, *err)
-	}
-
-	retroInit = C.dlsym(h, C.CString("retro_init"))
-	retroDeinit = C.dlsym(h, C.CString("retro_deinit"))
-	retroAPIVersion = C.dlsym(h, C.CString("retro_api_version"))
-	retroGetSystemInfo = C.dlsym(h, C.CString("retro_get_system_info"))
-	retroGetSystemAVInfo = C.dlsym(h, C.CString("retro_get_system_av_info"))
-	retroSetEnvironment = C.dlsym(h, C.CString("retro_set_environment"))
-	retroSetVideoRefresh = C.dlsym(h, C.CString("retro_set_video_refresh"))
-	retroSetInputPoll = C.dlsym(h, C.CString("retro_set_input_poll"))
-	retroSetInputState = C.dlsym(h, C.CString("retro_set_input_state"))
-	retroSetAudioSample = C.dlsym(h, C.CString("retro_set_audio_sample"))
-	retroSetAudioSampleBatch = C.dlsym(h, C.CString("retro_set_audio_sample_batch"))
-	retroRun = C.dlsym(h, C.CString("retro_run"))
-	retroLoadGame = C.dlsym(h, C.CString("retro_load_game"))
-	retroUnloadGame = C.dlsym(h, C.CString("retro_unload_game"))
-	retroSerializeSize = C.dlsym(h, C.CString("retro_serialize_size"))
-	retroSerialize = C.dlsym(h, C.CString("retro_serialize"))
-	retroUnserialize = C.dlsym(h, C.CString("retro_unserialize"))
+	retroInit = loadFunction(retroHandle, "retro_init")
+	retroDeinit = loadFunction(retroHandle, "retro_deinit")
+	retroAPIVersion = loadFunction(retroHandle, "retro_api_version")
+	retroGetSystemInfo = loadFunction(retroHandle, "retro_get_system_info")
+	retroGetSystemAVInfo = loadFunction(retroHandle, "retro_get_system_av_info")
+	retroSetEnvironment = loadFunction(retroHandle, "retro_set_environment")
+	retroSetVideoRefresh = loadFunction(retroHandle, "retro_set_video_refresh")
+	retroSetInputPoll = loadFunction(retroHandle, "retro_set_input_poll")
+	retroSetInputState = loadFunction(retroHandle, "retro_set_input_state")
+	retroSetAudioSample = loadFunction(retroHandle, "retro_set_audio_sample")
+	retroSetAudioSampleBatch = loadFunction(retroHandle, "retro_set_audio_sample_batch")
+	retroRun = loadFunction(retroHandle, "retro_run")
+	retroLoadGame = loadFunction(retroHandle, "retro_load_game")
+	retroUnloadGame = loadFunction(retroHandle, "retro_unload_game")
+	retroSerializeSize = loadFunction(retroHandle, "retro_serialize_size")
+	retroSerialize = loadFunction(retroHandle, "retro_serialize")
+	retroUnserialize = loadFunction(retroHandle, "retro_unserialize")
+	retroSetControllerPortDevice = loadFunction(retroHandle, "retro_set_controller_port_device")
 
 	mu.Unlock()
 
@@ -288,7 +471,7 @@ func coreLoad(pathNoExt string) {
 	C.bridge_retro_init(retroInit)
 
 	v := C.bridge_retro_api_version(retroAPIVersion)
-	fmt.Println("Libretro API version:", v)
+	log.Printf("Libretro API version: %v", v)
 }
 
 func slurp(path string, size int64) ([]byte, error) {
@@ -319,10 +502,12 @@ func coreLoadGame(filename string) {
 
 	size := fi.Size()
 
-	fmt.Println("ROM size:", size)
+	log.Printf("ROM size: %v", size)
 
+	csFilename := C.CString(filename)
+	defer C.free(unsafe.Pointer(csFilename))
 	gi := C.struct_retro_game_info{
-		path: C.CString(filename),
+		path: csFilename,
 		size: C.size_t(size),
 	}
 
@@ -331,11 +516,11 @@ func coreLoadGame(filename string) {
 	C.bridge_retro_get_system_info(retroGetSystemInfo, &si)
 
 	var libName = C.GoString(si.library_name)
-	fmt.Println("  library_name:", libName)
-	fmt.Println("  library_version:", C.GoString(si.library_version))
-	fmt.Println("  valid_extensions:", C.GoString(si.valid_extensions))
-	fmt.Println("  need_fullpath:", si.need_fullpath)
-	fmt.Println("  block_extract:", si.block_extract)
+	log.Printf("  library_name: %v", libName)
+	log.Printf("  library_version: %v", C.GoString(si.library_version))
+	log.Printf("  valid_extensions: %v", C.GoString(si.valid_extensions))
+	log.Printf("  need_fullpath: %v", si.need_fullpath)
+	log.Printf("  block_extract: %v", si.block_extract)
 
 	if !si.need_fullpath {
 		bytes, err := slurp(filename, size)
@@ -343,8 +528,8 @@ func coreLoadGame(filename string) {
 			panic(err)
 		}
 		cstr := C.CString(string(bytes))
+		defer C.free(unsafe.Pointer(cstr))
 		gi.data = unsafe.Pointer(cstr)
-
 	}
 
 	ok := C.bridge_retro_load_game(retroLoadGame, &gi)
@@ -358,7 +543,7 @@ func coreLoadGame(filename string) {
 
 	// Append the library name to the window title.
 	NAEmulator.meta.AudioSampleRate = int(avi.timing.sample_rate)
-	NAEmulator.meta.Fps = int(avi.timing.fps)
+	NAEmulator.meta.Fps = float64(avi.timing.fps)
 	NAEmulator.meta.BaseWidth = int(avi.geometry.base_width)
 	NAEmulator.meta.BaseHeight = int(avi.geometry.base_height)
 	// set aspect ratio
@@ -371,17 +556,45 @@ func coreLoadGame(filename string) {
 	}
 	NAEmulator.meta.Ratio = ratio
 
-	fmt.Println("-----------------------------------")
-	fmt.Println("--- System audio and video info ---")
-	fmt.Println("-----------------------------------")
-	fmt.Println("  Aspect ratio: ", ratio)
-	fmt.Println("  Base width: ", avi.geometry.base_width)   /* Nominal video width of game. */
-	fmt.Println("  Base height: ", avi.geometry.base_height) /* Nominal video height of game. */
-	fmt.Println("  Max width: ", avi.geometry.max_width)     /* Maximum possible width of game. */
-	fmt.Println("  Max height: ", avi.geometry.max_height)   /* Maximum possible height of game. */
-	fmt.Println("  Sample rate: ", avi.timing.sample_rate)   /* Sampling rate of audio. */
-	fmt.Println("  FPS: ", avi.timing.fps)                   /* FPS of video content. */
-	fmt.Println("-----------------------------------")
+	log.Printf("-----------------------------------")
+	log.Printf("---  Core audio and video info  ---")
+	log.Printf("-----------------------------------")
+	log.Printf("  Frame: %vx%v (%vx%v)",
+		avi.geometry.base_width, avi.geometry.base_height,
+		avi.geometry.max_width, avi.geometry.max_height)
+	log.Printf("  AR:    %v", ratio)
+	log.Printf("  FPS:   %v", avi.timing.fps)
+	log.Printf("  Audio: %vHz", avi.timing.sample_rate)
+	log.Printf("-----------------------------------")
+
+	video.maxWidth = int32(avi.geometry.max_width)
+	video.maxHeight = int32(avi.geometry.max_height)
+	video.baseWidth = int32(avi.geometry.base_width)
+	video.baseHeight = int32(avi.geometry.base_height)
+	if video.isGl {
+		if usesLibCo {
+			C.bridge_execute(C.initVideo_cgo)
+		} else {
+			runtime.LockOSThread()
+			initVideo()
+			runtime.UnlockOSThread()
+		}
+	}
+}
+
+func toggleMultitap() {
+	if multitap.supported && multitap.value != 0 {
+		// Official SNES games only support a single multitap device
+		// Most require it to be plugged in player 2 port
+		// And Snes9X requires it to be "plugged" after the game is loaded
+		// Control this from the browser since player 2 will stop working in some games if multitap is "plugged" in
+		if multitap.enabled {
+			C.bridge_retro_set_controller_port_device(retroSetControllerPortDevice, 1, C.RETRO_DEVICE_JOYPAD)
+		} else {
+			C.bridge_retro_set_controller_port_device(retroSetControllerPortDevice, 1, multitap.value)
+		}
+		multitap.enabled = !multitap.enabled
+	}
 }
 
 // serializeSize returns the amount of data the implementation requires to serialize
@@ -393,18 +606,21 @@ func serializeSize() uint {
 	return uint(C.bridge_retro_serialize_size(retroSerializeSize))
 }
 
-// serialize serializes internal state and returns the state as a byte slice.
+// Serializes internal state and returns the state as a byte slice.
 func serialize(size uint) ([]byte, error) {
 	data := C.malloc(C.size_t(size))
+	defer C.free(data)
+
 	ok := bool(C.bridge_retro_serialize(retroSerialize, data, C.size_t(size)))
 	if !ok {
 		return nil, errors.New("retro_serialize failed")
 	}
+
 	bytes := C.GoBytes(data, C.int(size))
 	return bytes, nil
 }
 
-// unserialize unserializes internal state from a byte slice.
+// unserialize deserializes internal state from a byte slice.
 func unserialize(bytes []byte, size uint) error {
 	if len(bytes) == 0 {
 		return nil
@@ -417,32 +633,87 @@ func unserialize(bytes []byte, size uint) error {
 }
 
 func nanoarchShutdown() {
-	C.bridge_retro_unload_game(retroUnloadGame)
-	C.bridge_retro_deinit(retroDeinit)
+	if usesLibCo {
+		thread.MainMaybe(func() {
+			C.bridge_execute(retroUnloadGame)
+			C.bridge_execute(retroDeinit)
+			if video.isGl {
+				C.bridge_execute(C.deinitVideo_cgo)
+			}
+		})
+	} else {
+		if video.isGl {
+			thread.MainMaybe(func() {
+				// running inside a go routine, lock the thread to make sure the OpenGL context stays current
+				runtime.LockOSThread()
+				graphics.BindContext()
+			})
+		}
+		C.bridge_retro_unload_game(retroUnloadGame)
+		C.bridge_retro_deinit(retroDeinit)
+		if video.isGl {
+			thread.MainMaybe(func() {
+				deinitVideo()
+				runtime.UnlockOSThread()
+			})
+		}
+	}
+
+	setRotation(0)
+	if err := closeLib(retroHandle); err != nil {
+		log.Printf("error when close: %v", err)
+	}
+	for _, element := range coreConfig {
+		C.free(unsafe.Pointer(element))
+	}
 }
 
 func nanoarchRun() {
-	C.bridge_retro_run(retroRun)
+	if usesLibCo {
+		C.bridge_execute(retroRun)
+	} else {
+		if video.isGl {
+			// running inside a go routine, lock the thread to make sure the OpenGL context stays current
+			runtime.LockOSThread()
+			graphics.BindContext()
+		}
+		C.bridge_retro_run(retroRun)
+		if video.isGl {
+			runtime.UnlockOSThread()
+		}
+	}
 }
 
 func videoSetPixelFormat(format uint32) C.bool {
 	switch format {
 	case C.RETRO_PIXEL_FORMAT_0RGB1555:
-		video.pixFmt = image.BIT_FORMAT_SHORT_5_5_5_1
+		video.pixFmt = image.BitFormatShort5551
+		graphics.SetPixelFormat(graphics.UnsignedShort5551)
 		video.bpp = 2
+		// format is not implemented
+		pixelFormatConverterFn = nil
 		break
 	case C.RETRO_PIXEL_FORMAT_XRGB8888:
-		video.pixFmt = image.BIT_FORMAT_INT_8_8_8_8_REV
+		video.pixFmt = image.BitFormatInt8888Rev
+		graphics.SetPixelFormat(graphics.UnsignedInt8888Rev)
 		video.bpp = 4
+		pixelFormatConverterFn = image.Rgba8888
 		break
 	case C.RETRO_PIXEL_FORMAT_RGB565:
-		video.pixFmt = image.BIT_FORMAT_SHORT_5_6_5
+		video.pixFmt = image.BitFormatShort565
+		graphics.SetPixelFormat(graphics.UnsignedShort565)
 		video.bpp = 2
+		pixelFormatConverterFn = image.Rgb565
 		break
 	default:
 		log.Fatalf("Unknown pixel type %v", format)
 	}
-
-	fmt.Printf("Video pixel: %v %v %v %v %v", video, format, C.RETRO_PIXEL_FORMAT_0RGB1555, C.RETRO_PIXEL_FORMAT_XRGB8888, C.RETRO_PIXEL_FORMAT_RGB565)
 	return true
+}
+
+func setRotation(rotation int) {
+	video.rotation = image.Angle(rotation)
+	rotationFn = image.GetRotation(video.rotation)
+	NAEmulator.meta.Rotation = rotationFn
+	log.Printf("[Env]: the game video is rotated %v°", map[int]int{0: 0, 1: 90, 2: 180, 3: 270}[rotation])
 }
